@@ -10,7 +10,6 @@
 #include <wlr/types/wlr_alpha_modifier_v1.h>
 #include <wlr/types/wlr_data_control_v1.h>
 #include <wlr/types/wlr_data_device.h>
-#include <wlr/types/wlr_drm.h>
 #include <wlr/types/wlr_drm_lease_v1.h>
 #include <wlr/types/wlr_export_dmabuf_v1.h>
 #include <wlr/types/wlr_ext_data_control_v1.h>
@@ -517,9 +516,6 @@ server_init(struct server *server)
 
 	if (wlr_renderer_get_texture_formats(
 			server->renderer, WLR_BUFFER_CAP_DMABUF)) {
-		if (wlr_renderer_get_drm_fd(server->renderer) >= 0) {
-			wlr_drm_create(server->wl_display, server->renderer);
-		}
 		server->linux_dmabuf = wlr_linux_dmabuf_v1_create_with_renderer(
 			server->wl_display,
 			LAB_WLR_LINUX_DMABUF_VERSION,
