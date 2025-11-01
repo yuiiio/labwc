@@ -279,6 +279,8 @@ struct server {
 	struct wlr_gamma_control_manager_v1 *gamma_control_manager_v1;
 	struct wl_listener gamma_control_set_gamma;
 
+	struct wlr_fifo_manager_v1 *fifo_manager_v1;
+
 	struct session_lock_manager *session_lock_manager;
 
 	struct wlr_foreign_toplevel_manager_v1 *foreign_toplevel_manager;

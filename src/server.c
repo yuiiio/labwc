@@ -17,6 +17,7 @@
 #include <wlr/types/wlr_ext_image_capture_source_v1.h>
 #include <wlr/types/wlr_ext_image_copy_capture_v1.h>
 #include <wlr/types/wlr_fixes.h>
+#include <wlr/types/wlr_fifo_v1.h>
 #include <wlr/types/wlr_foreign_toplevel_management_v1.h>
 #include <wlr/types/wlr_fractional_scale_v1.h>
 #include <wlr/types/wlr_input_method_v2.h>
@@ -711,6 +712,9 @@ server_init(struct server *server)
 	wl_signal_add(&server->tearing_control->events.new_object, &server->tearing_new_object);
 
 	server->tablet_manager = wlr_tablet_v2_create(server->wl_display);
+
+	server->fifo_manager_v1 = wlr_fifo_manager_v1_create(server->wl_display, 1);
+	wlr_scene_set_fifo_manager_v1(server->scene, server->fifo_manager_v1);
 
 	layers_init(server);
 
