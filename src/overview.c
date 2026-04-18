@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <assert.h>
-#include <limits.h>
 #include <math.h>
 #include <stdlib.h>
 #include <wlr/render/allocator.h>
@@ -29,14 +28,12 @@ static struct overview_state overview;
 /* Temporary struct for layout calculation */
 struct layout_item {
 	struct view *view;
-	/* Original position(window center) for sorting */
+	/* Original position (window center) for sorting */
 	int orig_x, orig_y;
 	/* Final position (top-left) */
 	int x, y;
 	/* Size after scaling */
 	int width, height;
-
-	int center_dist;
 };
 
 static void
@@ -162,42 +159,44 @@ create_item_at(struct wlr_scene_tree *parent, struct view *view,
 	return item;
 }
 
-struct cell {
-	int x, y;
-	bool used;
+/* Row structure for layout packing (stack-allocated) */
+struct row_info {
+	int start_idx;
+	int count;
+	int width;
+	int height;
 };
 
-static inline int
-cell_distance(struct layout_item *it, struct cell *cell,
-		int cell_width, int cell_height)
-{
-	int cx = cell->x * (cell_width + OVERVIEW_GAP) + cell_width / 2;
-	int cy = cell->y * (cell_height + OVERVIEW_GAP) + cell_height / 2;
-
-	int vx = it->orig_x;
-	int vy = it->orig_y;
-
-	int dx = (vx - cx);
-	int dy = (vy - cy);
-
-	return dx * dx + dy * dy;
-}
-
+/* Compare by height (ascending) for row packing */
 static int
-compare_center_distance_and_creation_id(const void *a, const void *b)
+compare_by_height(const void *a, const void *b)
 {
 	const struct layout_item *ia = a;
 	const struct layout_item *ib = b;
 
-	if (ia->center_dist != ib->center_dist) {
-		// big dist to small dist for stable placement
-		return ib->center_dist - ia->center_dist;
+	if (ia->height != ib->height) {
+		return ia->height - ib->height;
 	}
-
+	if (ia->orig_y != ib->orig_y) {
+		return ia->orig_y - ib->orig_y;
+	}
+	/* Stability: fall back to creation_id */
 	if (ia->view->creation_id != ib->view->creation_id) {
-		return (ia->view->creation_id < ib->view->creation_id) ? -1 : 1;
+		return (ia->view->creation_id < ib->view->creation_id) ? 1 : -1;
 	}
+	return 0;
+}
 
+/* Compare by original X position for row-internal sorting */
+static int
+compare_by_orig_x(const void *a, const void *b)
+{
+	const struct layout_item *ia = a;
+	const struct layout_item *ib = b;
+
+	if (ia->orig_x != ib->orig_x) {
+		return ia->orig_x - ib->orig_x;
+	}
 	return 0;
 }
 
@@ -234,8 +233,6 @@ overview_begin(void)
 	/* Available area for layout */
 	int avail_width = output_box.width - 2 * OVERVIEW_PADDING;
 	int avail_height = output_box.height - 2 * OVERVIEW_PADDING;
-	int avail_center_x = avail_width / 2;
-	int avail_center_y = avail_height / 2;
 
 	/* Allocate layout items */
 	struct layout_item *items = calloc(count, sizeof(*items));
@@ -244,97 +241,93 @@ overview_begin(void)
 		return;
 	}
 
-	/* Initialize items with view data */
+	/* Initialize items and calculate total area for scaling */
 	struct view **view_ptr;
 	int idx = 0;
+	double total_area = 0;
 	wl_array_for_each(view_ptr, &views) {
 		struct view *v = *view_ptr;
-		int center_x = v->current.x + v->current.width / 2;
-		int center_y = v->current.y + v->current.height / 2;
-		int dx = center_x - avail_center_x;
-		int dy = center_y - avail_center_y;
-
 		items[idx].view = v;
-		items[idx].orig_x = center_x;
-		items[idx].orig_y = center_y;
-		items[idx].center_dist = dx * dx + dy * dy;
+		items[idx].orig_x = v->current.x + v->current.width / 2;
+		items[idx].orig_y = v->current.y + v->current.height / 2;
+		total_area += (double)v->current.width * v->current.height;
 		idx++;
-		struct wlr_box current = v->current;
-		wlr_log(WLR_DEBUG, "overview: view: x: %d, y: %d, width: %d, height: %d",
-				current.x, current.y, current.width, current.height);
 	}
 
-	qsort(items, count, sizeof(*items), compare_center_distance_and_creation_id);
+	/* Calculate common scale based on area */
+	double avail_area = (double)avail_width * avail_height;
+	double scale = sqrt(avail_area * 0.7 / total_area);
+	scale = fmin(scale, 1.0);
+	scale = fmax(scale, 0.05);
 
-	/* Calculate grid dimensions */
-	//double aspect = (double)avail_width / avail_height;
-	//int cols = (int)ceil(sqrt((double)count * aspect));
-	int cols = (int)ceil(sqrt((double)count));
-	cols = cols < 1 ? 1 : cols;
-
-	int rows = (count + cols - 1) / cols;
-	int cell_count = rows * cols;
-	struct cell *cells = calloc(cell_count, sizeof(*cells));
-
-	int c_idx = 0;
-	for (int r = 0; r < rows; r++) {
-		for (int c = 0; c < cols; c++) {
-			cells[c_idx].x = c;
-			cells[c_idx].y = r;
-			cells[c_idx].used = false;
-			c_idx++;
-		}
+	/* Apply scale to all items */
+	for (int i = 0; i < count; i++) {
+		items[i].width = (int)(items[i].view->current.width * scale);
+		items[i].height = (int)(items[i].view->current.height * scale);
 	}
 
-	int cell_width =
-		(avail_width - (cols - 1) * OVERVIEW_GAP) / cols;
-	int cell_height =
-		(avail_height - (rows - 1) * OVERVIEW_GAP) / rows;
+	/* Sort by height for row packing */
+	qsort(items, count, sizeof(*items), compare_by_height);
+
+	/* Row packing (stack-allocated, max 32 rows) */
+	struct row_info rows[32];
+	int row_count = 0;
+	int current_row_width = 0;
+
+	rows[0] = (struct row_info){0, 0, 0, 0};
 
 	for (int i = 0; i < count; i++) {
-		struct layout_item *it = &items[i];
+		int w = items[i].width;
+		int h = items[i].height;
 
-		int best_j = -1;
-		int best_dist = INT_MAX;
-
-		for (int j = 0; j < cell_count; j++) {
-			if (cells[j].used) {
-				continue;
-			}
-
-			int d = cell_distance(it, &cells[j],
-					cell_width, cell_height);
-
-			if (d < best_dist) {
-				best_dist = d;
-				best_j = j;
-			}
+		/* Start new row if this item doesn't fit */
+		if (current_row_width + w + OVERVIEW_GAP > avail_width
+				&& rows[row_count].count > 0
+				&& row_count < 31) {
+			row_count++;
+			rows[row_count] = (struct row_info){i, 0, 0, 0};
+			current_row_width = 0;
 		}
 
-		cells[best_j].used = true;
+		rows[row_count].count++;
+		rows[row_count].width += w + OVERVIEW_GAP;
+		if (h > rows[row_count].height) {
+			rows[row_count].height = h;
+		}
+		current_row_width = rows[row_count].width;
+	}
+	row_count++;
 
-		int col = cells[best_j].x;
-		int row = cells[best_j].y;
-
-		/* scale */
-		double sx = (double)cell_width / it->view->current.width;
-		double sy = (double)cell_height / it->view->current.height;
-		double scale = fmin(sx, sy);
-
-		scale = scale > 1.0 ? 1.0 : scale;
-		scale = scale < 0.05 ? 0.05 : scale;
-
-		it->width = (int)(it->view->current.width * scale);
-		it->height = (int)(it->view->current.height * scale);
-
-		int cell_x = col * (cell_width + OVERVIEW_GAP);
-		int cell_y = row * (cell_height + OVERVIEW_GAP);
-
-		it->x = cell_x + (cell_width - it->width) / 2;
-		it->y = cell_y + (cell_height - it->height) / 2;
+	/* Sort items within each row by original X position */
+	for (int r = 0; r < row_count; r++) {
+		qsort(&items[rows[r].start_idx], rows[r].count,
+			sizeof(*items), compare_by_orig_x);
 	}
 
-	free(cells);
+	/* Calculate total height */
+	int total_height = 0;
+	for (int r = 0; r < row_count; r++) {
+		total_height += rows[r].height;
+		if (r < row_count - 1) {
+			total_height += OVERVIEW_GAP;
+		}
+	}
+
+	/* Calculate positions with centering */
+	int y_offset = (avail_height - total_height) / 2;
+	int y = y_offset;
+	for (int r = 0; r < row_count; r++) {
+		int row_width = rows[r].width - OVERVIEW_GAP; /* Remove trailing gap */
+		int x = (avail_width - row_width) / 2;
+
+		for (int j = rows[r].start_idx;
+				j < rows[r].start_idx + rows[r].count; j++) {
+			items[j].x = x;
+			items[j].y = y + (rows[r].height - items[j].height) / 2;
+			x += items[j].width + OVERVIEW_GAP;
+		}
+		y += rows[r].height + OVERVIEW_GAP;
+	}
 
 	/* Initialize overview state */
 	overview.active = true;
