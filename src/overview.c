@@ -19,11 +19,14 @@
 #include "common/list.h"
 #include "common/mem.h"
 #include "common/scene-helpers.h"
+#include "common/string-helpers.h"
 #include "config/rcxml.h"
+#include "input/cursor.h"
 #include "labwc.h"
 #include "node.h"
 #include "output.h"
 #include "overview.h"
+#include "scaled-buffer/scaled-font-buffer.h"
 #include "theme.h"
 #include "view.h"
 
@@ -73,6 +76,7 @@ struct layout_result {
 };
 
 static void overview_finish_immediate(bool focus_selected);
+static void overview_show_labels(void);
 
 static double
 ease_in_out_cubic(double t)
@@ -147,8 +151,83 @@ animation_tick(void *data)
 
 	if (overview.closing) {
 		overview_finish_immediate(overview.focus_on_finish);
+	} else {
+		overview_show_labels();
 	}
 	return 0;
+}
+
+static void
+overview_show_labels(void)
+{
+	struct theme *theme = rc.theme;
+	float *border_color =
+		theme->osd_window_switcher_thumbnail.item_active_border_color;
+
+	struct overview_item *item;
+	wl_list_for_each(item, &overview.items, link) {
+		int w = item->overview_w;
+		int h = item->overview_h;
+
+		/* Hover border: shown on demand, initially hidden */
+		struct lab_scene_rect_options hover_opts = {
+			.border_colors = (float *[1]){border_color},
+			.nr_borders = 1,
+			.border_width = 3,
+			.bg_color = NULL,
+			.width = w,
+			.height = h,
+		};
+		item->hover_border = lab_scene_rect_create(item->tree, &hover_opts);
+		wlr_scene_node_set_enabled(
+			&item->hover_border->tree->node, false);
+
+		/* Title label below thumbnail */
+		if (!string_null_or_empty(item->view->title)) {
+			item->title_label = scaled_font_buffer_create(item->tree);
+			wlr_scene_node_set_position(
+				&item->title_label->scene_buffer->node,
+				0, h + 2);
+			scaled_font_buffer_update(item->title_label,
+				item->view->title, w,
+				&rc.font_osd,
+				theme->osd_label_text_color, theme->osd_bg_color);
+		}
+	}
+
+	/* Update hover state for whatever is already under the cursor */
+	struct cursor_context ctx = get_cursor_context();
+	overview_on_cursor_motion(
+		ctx.type == LAB_NODE_OVERVIEW_ITEM ? ctx.node : NULL);
+}
+
+void
+overview_on_cursor_motion(struct wlr_scene_node *node)
+{
+	if (!overview.active || overview.animating) {
+		return;
+	}
+
+	struct overview_item *hovered = NULL;
+	if (node) {
+		hovered = node_overview_item_from_node(node);
+	}
+
+	if (overview.hovered == hovered) {
+		return;
+	}
+
+	if (overview.hovered && overview.hovered->hover_border) {
+		wlr_scene_node_set_enabled(
+			&overview.hovered->hover_border->tree->node, false);
+	}
+
+	overview.hovered = hovered;
+
+	if (hovered && hovered->hover_border) {
+		wlr_scene_node_set_enabled(
+			&hovered->hover_border->tree->node, true);
+	}
 }
 
 static void
@@ -933,6 +1012,19 @@ overview_finish(bool focus_selected)
 
 	overview.closing = true;
 	overview.focus_on_finish = focus_selected;
+
+	/* Hide labels and borders immediately when close starts */
+	struct overview_item *item;
+	wl_list_for_each(item, &overview.items, link) {
+		if (item->hover_border) {
+			wlr_scene_node_set_enabled(
+				&item->hover_border->tree->node, false);
+		}
+		if (item->title_label) {
+			wlr_scene_node_set_enabled(
+				&item->title_label->scene_buffer->node, false);
+		}
+	}
 
 	if (overview.animating) {
 		/*
