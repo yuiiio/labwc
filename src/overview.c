@@ -8,6 +8,7 @@
 #include <float.h>
 #include <math.h>
 #include <string.h>
+#include <time.h>
 #include <wlr/render/allocator.h>
 #include <wlr/render/swapchain.h>
 #include <wlr/types/wlr_buffer.h>
@@ -28,6 +29,9 @@
 
 /* Layout parameters (matching KWin defaults) */
 #define SEARCH_TOLERANCE 0.2
+
+/* Animation duration in milliseconds for full open/close */
+#define OVERVIEW_ANIM_MS 250
 #define IDEAL_WIDTH_RATIO 0.8
 #define RELATIVE_MARGIN 0.07
 #define RELATIVE_MIN_LENGTH 0.15
@@ -67,6 +71,111 @@ struct layered_packing {
 struct layout_result {
 	double x, y, width, height;
 };
+
+static void overview_finish_immediate(bool focus_selected);
+
+static double
+ease_in_out_cubic(double t)
+{
+	if (t < 0.5) {
+		return 4.0 * t * t * t;
+	}
+	double f = 2.0 * t - 2.0;
+	return 0.5 * f * f * f + 1.0;
+}
+
+static int
+lerp_int(int a, int b, double t)
+{
+	return a + (int)((double)(b - a) * t);
+}
+
+static void
+apply_visual_t(double t)
+{
+	struct overview_item *item;
+	wl_list_for_each(item, &overview.items, link) {
+		int x = lerp_int(item->normal_x, item->overview_x, t);
+		int y = lerp_int(item->normal_y, item->overview_y, t);
+		int w = lerp_int(item->normal_w, item->overview_w, t);
+		int h = lerp_int(item->normal_h, item->overview_h, t);
+
+		wlr_scene_node_set_position(&item->tree->node, x, y);
+		lab_scene_rect_set_size(item->border, w, h);
+		wlr_scene_rect_set_size(item->hitbox, w, h);
+		if (item->thumbnail) {
+			wlr_scene_buffer_set_dest_size(item->thumbnail, w, h);
+		}
+	}
+
+	struct theme *theme = rc.theme;
+	float color[4] = {
+		theme->overview_bg_color[0],
+		theme->overview_bg_color[1],
+		theme->overview_bg_color[2],
+		theme->overview_bg_color[3] * (float)t,
+	};
+	wlr_scene_rect_set_color(overview.background, color);
+}
+
+static int
+animation_tick(void *data)
+{
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	double elapsed_ms =
+		(double)(now.tv_sec - overview.anim_start.tv_sec) * 1000.0
+		+ (double)(now.tv_nsec - overview.anim_start.tv_nsec) / 1.0e6;
+	double raw = fmin(1.0, elapsed_ms / (double)overview.anim_duration_ms);
+	double eased = ease_in_out_cubic(raw);
+	double t = overview.anim_from_t
+		+ (overview.anim_to_t - overview.anim_from_t) * eased;
+
+	overview.current_t = t;
+	apply_visual_t(t);
+	wlr_output_schedule_frame(overview.output->wlr_output);
+
+	if (raw < 1.0) {
+		wl_event_source_timer_update(overview.anim_timer, 8);
+		return 0;
+	}
+
+	/* Animation complete */
+	overview.animating = false;
+	wl_event_source_remove(overview.anim_timer);
+	overview.anim_timer = NULL;
+
+	if (overview.closing) {
+		overview_finish_immediate(overview.focus_on_finish);
+	}
+	return 0;
+}
+
+static void
+start_animation(double from_t, double to_t)
+{
+	double distance = fabs(to_t - from_t);
+	if (distance < 0.001) {
+		overview.current_t = to_t;
+		apply_visual_t(to_t);
+		if (overview.closing) {
+			overview_finish_immediate(overview.focus_on_finish);
+		}
+		return;
+	}
+
+	overview.animating = true;
+	overview.anim_from_t = from_t;
+	overview.anim_to_t = to_t;
+	overview.anim_duration_ms = (uint32_t)(distance * OVERVIEW_ANIM_MS);
+	clock_gettime(CLOCK_MONOTONIC, &overview.anim_start);
+
+	if (!overview.anim_timer) {
+		overview.anim_timer = wl_event_loop_add_timer(
+			server.wl_event_loop, animation_tick, NULL);
+	}
+	wl_event_source_timer_update(overview.anim_timer, 1);
+}
 
 static void
 render_node(struct wlr_render_pass *pass,
@@ -173,19 +282,18 @@ create_item_at(struct wlr_scene_tree *parent, struct view *view,
 		.width = width,
 		.height = height,
 	};
-	lab_scene_rect_create(tree, &opts);
+	item->border = lab_scene_rect_create(tree, &opts);
 
 	/* Invisible hitbox for mouse clicks */
-	lab_wlr_scene_rect_create(tree, width, height, (float[4]) {0});
+	item->hitbox = lab_wlr_scene_rect_create(tree, width, height,
+		(float[4]){0});
 
 	/* Thumbnail */
 	struct wlr_buffer *thumb_buffer = render_thumb(output, view);
 	if (thumb_buffer) {
-		struct wlr_scene_buffer *thumb_scene_buffer =
-			lab_wlr_scene_buffer_create(tree, thumb_buffer);
+		item->thumbnail = lab_wlr_scene_buffer_create(tree, thumb_buffer);
 		wlr_buffer_drop(thumb_buffer);
-		wlr_scene_buffer_set_dest_size(thumb_scene_buffer,
-			width, height);
+		wlr_scene_buffer_set_dest_size(item->thumbnail, width, height);
 	}
 
 	return item;
@@ -716,30 +824,54 @@ overview_begin(void)
 	overview.tree = lab_wlr_scene_tree_create(&server.scene->tree);
 	wlr_scene_node_raise_to_top(&overview.tree->node);
 
-	/* Background overlay */
+	/*
+	 * Background overlay: start fully transparent; animation fades it in.
+	 */
 	struct theme *theme = rc.theme;
-	float bg_color[4] = {
+	float bg_transparent[4] = {
 		theme->overview_bg_color[0],
 		theme->overview_bg_color[1],
 		theme->overview_bg_color[2],
-		theme->overview_bg_color[3],
+		0.0f,
 	};
-	struct wlr_scene_rect *bg = lab_wlr_scene_rect_create(overview.tree,
-		output_box.width, output_box.height, bg_color);
-	wlr_scene_node_set_position(&bg->node, output_box.x, output_box.y);
+	overview.background = lab_wlr_scene_rect_create(overview.tree,
+		output_box.width, output_box.height, bg_transparent);
+	wlr_scene_node_set_position(&overview.background->node,
+		output_box.x, output_box.y);
 
-	/* Create content tree */
+	/* Create content tree positioned at usable area origin */
 	struct wlr_scene_tree *content_tree =
 		lab_wlr_scene_tree_create(overview.tree);
 	wlr_scene_node_set_position(&content_tree->node,
 		output_box.x + (int)margin,
 		output_box.y + (int)margin);
 
-	/* Create items at calculated positions */
-	for (int i = 0; i < count; i++) {
-		create_item_at(content_tree, windows[i].view, output,
-			(int)results[i].x, (int)results[i].y,
-			(int)results[i].width, (int)results[i].height);
+	int content_origin_x = output_box.x + (int)margin;
+	int content_origin_y = output_box.y + (int)margin;
+
+	/*
+	 * Create items in reverse focus order so that the frontmost window
+	 * (windows[0]) is added last and rendered on top during animation.
+	 * windows[] is front-to-back; in the scene graph last child = top.
+	 */
+	for (int i = count - 1; i >= 0; i--) {
+		struct view *v = windows[i].view;
+		int norm_x = v->current.x - content_origin_x;
+		int norm_y = v->current.y - content_origin_y;
+		int norm_w = v->current.width;
+		int norm_h = v->current.height;
+
+		struct overview_item *item = create_item_at(content_tree, v,
+			output, norm_x, norm_y, norm_w, norm_h);
+
+		item->normal_x = norm_x;
+		item->normal_y = norm_y;
+		item->normal_w = norm_w;
+		item->normal_h = norm_h;
+		item->overview_x = (int)results[i].x;
+		item->overview_y = (int)results[i].y;
+		item->overview_w = (int)results[i].width;
+		item->overview_h = (int)results[i].height;
 	}
 
 	free_packing(&packing);
@@ -751,13 +883,19 @@ overview_begin(void)
 		LAB_INPUT_STATE_OVERVIEW, LAB_CURSOR_DEFAULT);
 
 	cursor_update_focus();
+
+	/* Animate from normal window positions to overview positions */
+	overview.closing = false;
+	overview.current_t = 0.0;
+	start_animation(0.0, 1.0);
 }
 
-void
-overview_finish(bool focus_selected)
+static void
+overview_finish_immediate(bool focus_selected)
 {
-	if (!overview.active) {
-		return;
+	if (overview.anim_timer) {
+		wl_event_source_remove(overview.anim_timer);
+		overview.anim_timer = NULL;
 	}
 
 	if (overview.tree) {
@@ -770,11 +908,48 @@ overview_finish(bool focus_selected)
 		free(item);
 	}
 
+	struct view *selected_view = focus_selected ? overview.selected_view : NULL;
+
 	overview = (struct overview_state){0};
 	wl_list_init(&overview.items);
 
 	seat_focus_override_end(&server.seat, /*restore_focus*/ !focus_selected);
+	if (selected_view) {
+		desktop_focus_view(selected_view, /*raise*/ true);
+	}
 	cursor_update_focus();
+}
+
+void
+overview_finish(bool focus_selected)
+{
+	if (!overview.active) {
+		return;
+	}
+	if (overview.closing) {
+		/* Already animating toward close, nothing to do */
+		return;
+	}
+
+	overview.closing = true;
+	overview.focus_on_finish = focus_selected;
+
+	if (overview.animating) {
+		/*
+		 * Reverse mid-open animation. Mirror the raw progress so the
+		 * visual position stays continuous (approximate for cubic easing
+		 * but imperceptible at this timescale).
+		 */
+		double midpoint = overview.current_t;
+		if (overview.anim_timer) {
+			wl_event_source_remove(overview.anim_timer);
+			overview.anim_timer = NULL;
+		}
+		overview.animating = false;
+		start_animation(midpoint, 0.0);
+	} else {
+		start_animation(overview.current_t, 0.0);
+	}
 }
 
 void
@@ -783,13 +958,15 @@ overview_on_cursor_release(struct wlr_scene_node *node)
 	assert(server.input_mode == LAB_INPUT_STATE_OVERVIEW);
 
 	struct overview_item *item = node_overview_item_from_node(node);
-	struct view *view = item->view;
+
+	/*
+	 * Raise the selected item's scene tree to the top so it stays
+	 * visually in the foreground during the close animation.
+	 */
+	wlr_scene_node_raise_to_top(&item->tree->node);
+	overview.selected_view = item->view;
 
 	overview_finish(/*focus_selected*/ true);
-
-	if (view) {
-		desktop_focus_view(view, /*raise*/ true);
-	}
 }
 
 void

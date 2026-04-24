@@ -3,23 +3,50 @@
 #define LABWC_OVERVIEW_H
 
 #include <stdbool.h>
+#include <time.h>
 #include <wayland-server-core.h>
 
+struct lab_scene_rect;
 struct output;
 struct view;
+struct wl_event_source;
+struct wlr_scene_buffer;
 struct wlr_scene_node;
+struct wlr_scene_rect;
+struct wlr_scene_tree;
 
 struct overview_item {
 	struct view *view;
 	struct wlr_scene_tree *tree;
+	struct lab_scene_rect *border;      /* border rect for resize */
+	struct wlr_scene_rect *hitbox;      /* invisible hitbox for resize */
+	struct wlr_scene_buffer *thumbnail; /* thumbnail for dest_size */
 	struct wl_list link;
+
+	/* Start position: window's current position relative to content_tree */
+	int normal_x, normal_y, normal_w, normal_h;
+	/* End position: calculated overview position relative to content_tree */
+	int overview_x, overview_y, overview_w, overview_h;
 };
 
 struct overview_state {
 	bool active;
 	struct wl_list items; /* struct overview_item.link */
 	struct wlr_scene_tree *tree;
+	struct wlr_scene_rect *background; /* full-screen overlay for fade */
 	struct output *output;
+
+	/* Animation */
+	bool animating;
+	bool closing;           /* true = animating toward t=0 (normal) */
+	bool focus_on_finish;   /* focus selected view when close completes */
+	struct view *selected_view; /* view to focus when close animation ends */
+	double current_t;       /* current visual progress [0=normal, 1=overview] */
+	double anim_from_t;
+	double anim_to_t;
+	struct timespec anim_start;
+	uint32_t anim_duration_ms;
+	struct wl_event_source *anim_timer;
 };
 
 /* Begin overview mode */
