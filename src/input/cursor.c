@@ -640,6 +640,12 @@ cursor_process_motion(uint32_t time, double *sx, double *sy)
 	struct cursor_context ctx = get_cursor_context();
 	struct seat *seat = &server.seat;
 
+	if (server.input_mode == LAB_INPUT_STATE_OVERVIEW) {
+		overview_on_cursor_motion(
+			ctx.type == LAB_NODE_OVERVIEW_ITEM ? ctx.node : NULL);
+		return false;
+	}
+
 	if (ctx.type == LAB_NODE_MENUITEM) {
 		menu_process_cursor_motion(ctx.node);
 		cursor_set(&server.seat, LAB_CURSOR_DEFAULT);
