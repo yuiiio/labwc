@@ -1364,11 +1364,26 @@ run_action(struct view *view, struct action *action,
 		}
 		if (follow) {
 			int direction = 0;
-			if (action->type == ACTION_TYPE_GO_TO_DESKTOP) {
+			if (action->type == ACTION_TYPE_GO_TO_DESKTOP
+					&& target_workspace != server.workspaces.current) {
 				if (!strcasecmp(to, "right")) {
 					direction = 1;
 				} else if (!strcasecmp(to, "left")) {
 					direction = -1;
+				} else {
+					/* Derive direction from workspace index */
+					struct workspace *ws;
+					int cur = 0, tgt = 0, i = 0;
+					wl_list_for_each(ws, &server.workspaces.all, link) {
+						if (ws == server.workspaces.current) {
+							cur = i;
+						}
+						if (ws == target_workspace) {
+							tgt = i;
+						}
+						i++;
+					}
+					direction = (tgt > cur) ? 1 : -1;
 				}
 			}
 			if (direction && overview_is_active()) {
