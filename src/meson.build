@@ -31,6 +31,7 @@ labwc_sources = files(
   'view.c',
   'view-impl-common.c',
   'window-rules.c',
+  'workspace-transition.c',
   'workspaces.c',
   'xdg.c',
   'xdg-popup.c',
