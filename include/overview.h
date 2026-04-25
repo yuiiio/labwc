@@ -11,6 +11,7 @@ struct output;
 struct scaled_font_buffer;
 struct view;
 struct wl_event_source;
+struct workspace;
 struct wlr_scene_buffer;
 struct wlr_scene_node;
 struct wlr_scene_rect;
@@ -51,7 +52,18 @@ struct overview_state {
 	struct timespec anim_start;
 	uint32_t anim_duration_ms;
 	struct wl_event_source *anim_timer;
+
+	/* Workspace slide (GoToDesktop during overview) */
+	bool ws_sliding;
+	struct wlr_scene_tree *ws_slide_overlay; /* old overview tree sliding out */
+	int ws_slide_direction;
+	int ws_slide_width;
+	struct timespec ws_slide_start;
+	struct wl_event_source *ws_slide_timer;
 };
+
+/* Returns true if overview mode is active */
+bool overview_is_active(void);
 
 /* Begin overview mode */
 void overview_begin(void);
@@ -71,5 +83,8 @@ void overview_on_cursor_motion(struct wlr_scene_node *node);
 /* Get overview item from scene node */
 struct overview_item *node_overview_item_from_node(
 	struct wlr_scene_node *wlr_scene_node);
+
+/* Switch to target workspace with sliding animation while overview is active */
+void overview_goto_workspace(struct workspace *target, int direction);
 
 #endif /* LABWC_OVERVIEW_H */

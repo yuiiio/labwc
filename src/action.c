@@ -34,6 +34,7 @@
 #include "theme.h"
 #include "translate.h"
 #include "view.h"
+#include "workspace-transition.h"
 #include "workspaces.h"
 
 enum action_arg_type {
@@ -1362,8 +1363,23 @@ run_action(struct view *view, struct action *action,
 			}
 		}
 		if (follow) {
-			workspaces_switch_to(target_workspace,
-				/*update_focus*/ true);
+			int direction = 0;
+			if (action->type == ACTION_TYPE_GO_TO_DESKTOP) {
+				if (!strcasecmp(to, "right")) {
+					direction = 1;
+				} else if (!strcasecmp(to, "left")) {
+					direction = -1;
+				}
+			}
+			if (direction && overview_is_active()) {
+				overview_goto_workspace(target_workspace, direction);
+			} else if (direction) {
+				workspace_transition_begin(target_workspace,
+					direction, /*update_focus*/ true);
+			} else {
+				workspaces_switch_to(target_workspace,
+					/*update_focus*/ true);
+			}
 		}
 		break;
 	}

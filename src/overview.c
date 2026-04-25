@@ -10,6 +10,7 @@
 #include <string.h>
 #include <time.h>
 #include <wlr/render/allocator.h>
+#include <wlr/render/pass.h>
 #include <wlr/render/swapchain.h>
 #include <wlr/types/wlr_buffer.h>
 #include <wlr/types/wlr_output_layout.h>
@@ -29,6 +30,7 @@
 #include "scaled-buffer/scaled-font-buffer.h"
 #include "theme.h"
 #include "view.h"
+#include "workspaces.h"
 
 /* Layout parameters (matching KWin defaults) */
 #define SEARCH_TOLERANCE 0.2
@@ -77,6 +79,7 @@ struct layout_result {
 
 static void overview_finish_immediate(bool focus_selected);
 static void overview_show_labels(void);
+static int ws_slide_tick(void *data);
 
 static double
 ease_in_out_cubic(double t)
@@ -195,7 +198,7 @@ overview_show_labels(void)
 void
 overview_on_cursor_motion(struct wlr_scene_node *node)
 {
-	if (!overview.active || overview.animating) {
+	if (!overview.active || overview.animating || overview.ws_sliding) {
 		return;
 	}
 
@@ -251,45 +254,61 @@ static void
 render_node(struct wlr_render_pass *pass,
 		struct wlr_scene_node *node, int x, int y)
 {
+	if (!node->enabled) {
+		return;
+	}
+	x += node->x;
+	y += node->y;
 	switch (node->type) {
 	case WLR_SCENE_NODE_TREE: {
 		struct wlr_scene_tree *tree = wlr_scene_tree_from_node(node);
 		struct wlr_scene_node *child;
 		wl_list_for_each(child, &tree->children, link) {
-			render_node(pass, child, x + node->x, y + node->y);
+			render_node(pass, child, x, y);
 		}
 		break;
 	}
 	case WLR_SCENE_NODE_BUFFER: {
-		struct wlr_scene_buffer *scene_buffer =
-			wlr_scene_buffer_from_node(node);
-		if (!scene_buffer->buffer) {
+		struct wlr_scene_buffer *sb = wlr_scene_buffer_from_node(node);
+		if (!sb->buffer) {
 			break;
 		}
-		struct wlr_texture *texture = NULL;
-		struct wlr_client_buffer *client_buffer =
-			wlr_client_buffer_get(scene_buffer->buffer);
-		if (client_buffer) {
-			texture = client_buffer->texture;
-		}
-		if (!texture) {
+		struct wlr_client_buffer *cb = wlr_client_buffer_get(sb->buffer);
+		if (!cb || !cb->texture) {
 			break;
 		}
 		wlr_render_pass_add_texture(pass, &(struct wlr_render_texture_options){
-			.texture = texture,
-			.src_box = scene_buffer->src_box,
+			.texture = cb->texture,
+			.src_box = sb->src_box,
 			.dst_box = {
 				.x = x,
 				.y = y,
-				.width = scene_buffer->dst_width,
-				.height = scene_buffer->dst_height,
+				.width = sb->dst_width,
+				.height = sb->dst_height,
 			},
-			.transform = scene_buffer->transform,
+			.transform = sb->transform,
 		});
 		break;
 	}
-	case WLR_SCENE_NODE_RECT:
+	case WLR_SCENE_NODE_RECT: {
+		struct wlr_scene_rect *rect = wlr_scene_rect_from_node(node);
+		wlr_render_pass_add_rect(pass, &(struct wlr_render_rect_options){
+			.box = {
+				.x = x,
+				.y = y,
+				.width = rect->width,
+				.height = rect->height,
+			},
+			.color = {
+				.r = rect->color[0],
+				.g = rect->color[1],
+				.b = rect->color[2],
+				.a = rect->color[3],
+			},
+			.blend_mode = WLR_RENDER_BLEND_MODE_PREMULTIPLIED,
+		});
 		break;
+	}
 	}
 }
 
@@ -308,6 +327,11 @@ render_thumb(struct output *output, struct view *view)
 	}
 	struct wlr_render_pass *pass = wlr_renderer_begin_buffer_pass(
 		server.renderer, buffer, NULL);
+	if (!pass) {
+		wlr_log(WLR_ERROR, "failed to begin render pass for overview thumbnail");
+		wlr_buffer_drop(buffer);
+		return NULL;
+	}
 	render_node(pass, &view->content_tree->node, 0, 0);
 	if (!wlr_render_pass_submit(pass)) {
 		wlr_log(WLR_ERROR, "failed to submit render pass");
@@ -840,6 +864,29 @@ overview_begin(void)
 	int count = wl_array_len(&views);
 	if (count == 0) {
 		wl_array_release(&views);
+		/* Still show background for empty workspace */
+		overview.active = true;
+		overview.output = output;
+		wl_list_init(&overview.items);
+		overview.tree = lab_wlr_scene_tree_create(&server.scene->tree);
+		wlr_scene_node_raise_to_top(&overview.tree->node);
+		wlr_scene_node_reparent(&output->layer_tree[0]->node, overview.tree);
+		wlr_scene_node_lower_to_bottom(&output->layer_tree[0]->node);
+		struct theme *theme_empty = rc.theme;
+		float bg_empty[4] = {
+			theme_empty->overview_bg_color[0],
+			theme_empty->overview_bg_color[1],
+			theme_empty->overview_bg_color[2],
+			theme_empty->overview_bg_color[3],
+		};
+		overview.background = lab_wlr_scene_rect_create(overview.tree,
+			output_box.width, output_box.height, bg_empty);
+		wlr_scene_node_set_position(&overview.background->node,
+			output_box.x, output_box.y);
+		overview.current_t = 1.0;
+		seat_focus_override_begin(&server.seat,
+			LAB_INPUT_STATE_OVERVIEW, LAB_CURSOR_DEFAULT);
+		cursor_update_focus();
 		return;
 	}
 
@@ -893,6 +940,10 @@ overview_begin(void)
 	/* Create overview tree */
 	overview.tree = lab_wlr_scene_tree_create(&server.scene->tree);
 	wlr_scene_node_raise_to_top(&overview.tree->node);
+
+	/* Move wallpaper into overview tree as bottommost layer */
+	wlr_scene_node_reparent(&output->layer_tree[0]->node, overview.tree);
+	wlr_scene_node_lower_to_bottom(&output->layer_tree[0]->node);
 
 	/*
 	 * Background overlay
@@ -968,7 +1019,21 @@ overview_finish_immediate(bool focus_selected)
 		overview.anim_timer = NULL;
 	}
 
+	if (overview.ws_slide_timer) {
+		wl_event_source_remove(overview.ws_slide_timer);
+	}
+	if (overview.ws_slide_overlay) {
+		wlr_scene_node_destroy(&overview.ws_slide_overlay->node);
+	}
+
 	if (overview.tree) {
+		/* Restore wallpaper to scene root before destroying overview tree */
+		wlr_scene_node_reparent(&overview.output->layer_tree[0]->node,
+			&server.scene->tree);
+		wlr_scene_node_lower_to_bottom(
+			&overview.output->layer_tree[1]->node);
+		wlr_scene_node_lower_to_bottom(
+			&overview.output->layer_tree[0]->node);
 		wlr_scene_node_destroy(&overview.tree->node);
 	}
 
@@ -996,8 +1061,7 @@ overview_finish(bool focus_selected)
 	if (!overview.active) {
 		return;
 	}
-	if (overview.closing) {
-		/* Already animating toward close, nothing to do */
+	if (overview.closing || overview.ws_sliding) {
 		return;
 	}
 
@@ -1060,4 +1124,139 @@ overview_toggle(void)
 	} else {
 		overview_begin();
 	}
+}
+
+bool
+overview_is_active(void)
+{
+	return overview.active;
+}
+
+static int
+ws_slide_tick(void *data)
+{
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	double elapsed_ms =
+		(double)(now.tv_sec - overview.ws_slide_start.tv_sec) * 1000.0
+		+ (double)(now.tv_nsec - overview.ws_slide_start.tv_nsec) / 1.0e6;
+	double raw = fmin(1.0, elapsed_ms / (double)OVERVIEW_ANIM_MS);
+	double eased = ease_in_out_cubic(raw);
+
+	int slide = (int)(eased * overview.ws_slide_width);
+	int from_x = -overview.ws_slide_direction * slide;
+	int tree_x = overview.ws_slide_direction * (overview.ws_slide_width - slide);
+
+	wlr_scene_node_set_position(&overview.ws_slide_overlay->node, from_x, 0);
+	wlr_scene_node_set_position(&overview.tree->node, tree_x, 0);
+	wlr_output_schedule_frame(overview.output->wlr_output);
+
+	if (raw < 1.0) {
+		wl_event_source_timer_update(overview.ws_slide_timer, 8);
+		return 0;
+	}
+
+	/* Slide complete: restore workspace tree and move wallpaper into overview */
+	wlr_scene_node_set_enabled(&server.workspaces.current->tree->node, true);
+	wlr_scene_node_reparent(&overview.output->layer_tree[0]->node, overview.tree);
+	wlr_scene_node_lower_to_bottom(&overview.output->layer_tree[0]->node);
+	wlr_scene_node_destroy(&overview.ws_slide_overlay->node);
+	overview.ws_slide_overlay = NULL;
+	wl_event_source_remove(overview.ws_slide_timer);
+	overview.ws_slide_timer = NULL;
+	overview.ws_sliding = false;
+
+	wlr_scene_node_set_position(&overview.tree->node, 0, 0);
+
+	if (!wl_list_empty(&overview.items)) {
+		overview_show_labels();
+	}
+	return 0;
+}
+
+void
+overview_goto_workspace(struct workspace *target, int direction)
+{
+	if (!overview.active || overview.ws_sliding) {
+		return;
+	}
+
+	struct output *output = overview.output;
+	struct wlr_box box;
+	wlr_output_layout_get_box(server.output_layout, output->wlr_output, &box);
+	int width = box.width;
+	if (width <= 0) {
+		return;
+	}
+
+	/* Keep the current overview tree alive as the slide-out element */
+	struct wlr_scene_tree *old_tree = overview.tree;
+
+	/* Cancel any in-progress open/close animation */
+	if (overview.anim_timer) {
+		wl_event_source_remove(overview.anim_timer);
+	}
+
+	/* Reparent wallpaper back so the new overview can use it */
+	wlr_scene_node_reparent(&output->layer_tree[0]->node, &server.scene->tree);
+	wlr_scene_node_lower_to_bottom(&output->layer_tree[1]->node);
+	wlr_scene_node_lower_to_bottom(&output->layer_tree[0]->node);
+
+	/* Free overview item structs (scene nodes remain alive inside old_tree) */
+	struct overview_item *item, *tmp;
+	wl_list_for_each_safe(item, tmp, &overview.items, link) {
+		wl_list_remove(&item->link);
+		free(item);
+	}
+
+	/* Reset overview state without destroying old_tree */
+	overview = (struct overview_state){0};
+	wl_list_init(&overview.items);
+
+	/* Restore input mode so overview_begin() can run */
+	seat_focus_override_end(&server.seat, /*restore_focus*/ false);
+
+	/* Switch workspace and update focus to new workspace's window */
+	workspaces_switch_to(target, /*update_focus*/ true);
+
+	/* Build new overview at t=1 (items in final positions) */
+	overview_begin();
+	if (!overview.active) {
+		wlr_scene_node_destroy(&old_tree->node);
+		return;
+	}
+	if (overview.anim_timer) {
+		wl_event_source_remove(overview.anim_timer);
+		overview.anim_timer = NULL;
+	}
+	overview.animating = false;
+	overview.current_t = 1.0;
+	apply_visual_t(1.0);
+
+	/*
+	 * Keep wallpaper stationary: undo the layer_tree[0] reparent that
+	 * overview_begin() just did. It will be moved back into overview.tree
+	 * when the slide completes.
+	 */
+	wlr_scene_node_reparent(&output->layer_tree[0]->node, &server.scene->tree);
+	wlr_scene_node_lower_to_bottom(&output->layer_tree[1]->node);
+	wlr_scene_node_lower_to_bottom(&output->layer_tree[0]->node);
+
+	/* New overview starts off-screen in the travel direction */
+	wlr_scene_node_set_position(&overview.tree->node, direction * width, 0);
+
+	/* Raise old_tree above new overview so it slides over it */
+	wlr_scene_node_raise_to_top(&old_tree->node);
+
+	/* Hide workspace tree so windows don't show through the dim overlay */
+	wlr_scene_node_set_enabled(&server.workspaces.current->tree->node, false);
+
+	overview.ws_slide_overlay = old_tree;
+	overview.ws_slide_direction = direction;
+	overview.ws_slide_width = width;
+	overview.ws_sliding = true;
+	clock_gettime(CLOCK_MONOTONIC, &overview.ws_slide_start);
+	overview.ws_slide_timer = wl_event_loop_add_timer(
+		server.wl_event_loop, ws_slide_tick, NULL);
+	wl_event_source_timer_update(overview.ws_slide_timer, 1);
 }
