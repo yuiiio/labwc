@@ -111,15 +111,6 @@ apply_visual_t(double t)
 			wlr_scene_buffer_set_dest_size(item->thumbnail, w, h);
 		}
 	}
-
-	struct theme *theme = rc.theme;
-	float color[4] = {
-		theme->overview_bg_color[0],
-		theme->overview_bg_color[1],
-		theme->overview_bg_color[2],
-		theme->overview_bg_color[3] * (float)t,
-	};
-	wlr_scene_rect_set_color(overview.background, color);
 }
 
 static int
@@ -904,14 +895,14 @@ overview_begin(void)
 	wlr_scene_node_raise_to_top(&overview.tree->node);
 
 	/*
-	 * Background overlay: start fully transparent; animation fades it in.
+	 * Background overlay
 	 */
 	struct theme *theme = rc.theme;
 	float bg_transparent[4] = {
 		theme->overview_bg_color[0],
 		theme->overview_bg_color[1],
 		theme->overview_bg_color[2],
-		0.0f,
+		theme->overview_bg_color[3],
 	};
 	overview.background = lab_wlr_scene_rect_create(overview.tree,
 		output_box.width, output_box.height, bg_transparent);
