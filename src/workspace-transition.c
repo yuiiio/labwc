@@ -2,13 +2,8 @@
 #include "workspace-transition.h"
 #include <math.h>
 #include <time.h>
-#include <wlr/render/allocator.h>
-#include <wlr/render/pass.h>
-#include <wlr/render/swapchain.h>
-#include <wlr/types/wlr_buffer.h>
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_scene.h>
-#include <wlr/util/log.h>
 #include "common/scene-helpers.h"
 #include "labwc.h"
 #include "output.h"
@@ -19,9 +14,9 @@
 struct workspace_transition {
 	bool active;
 	struct wl_event_source *timer;
-	struct wlr_scene_tree *overlay;
-	struct wlr_scene_buffer *from_buf;
-	struct wlr_scene_buffer *to_buf;
+	struct wlr_scene_tree *from_overlay;
+	struct workspace *from_ws;
+	struct workspace *to_ws;
 	struct output *output;
 	int direction;
 	int width;
@@ -41,83 +36,6 @@ ease_in_out_cubic(double t)
 }
 
 static void
-render_node(struct wlr_render_pass *pass, struct wlr_scene_node *node,
-		int x, int y)
-{
-	if (!node->enabled) {
-		return;
-	}
-	x += node->x;
-	y += node->y;
-
-	switch (node->type) {
-	case WLR_SCENE_NODE_TREE: {
-		struct wlr_scene_tree *tree = wlr_scene_tree_from_node(node);
-		struct wlr_scene_node *child;
-		wl_list_for_each(child, &tree->children, link) {
-			render_node(pass, child, x, y);
-		}
-		break;
-	}
-	case WLR_SCENE_NODE_BUFFER: {
-		struct wlr_scene_buffer *sb = wlr_scene_buffer_from_node(node);
-		if (!sb->buffer) {
-			break;
-		}
-		struct wlr_client_buffer *cb = wlr_client_buffer_get(sb->buffer);
-		if (!cb || !cb->texture) {
-			break;
-		}
-		wlr_render_pass_add_texture(pass, &(struct wlr_render_texture_options){
-			.texture = cb->texture,
-			.src_box = sb->src_box,
-			.dst_box = {
-				.x = x,
-				.y = y,
-				.width = sb->dst_width,
-				.height = sb->dst_height,
-			},
-			.transform = sb->transform,
-		});
-		break;
-	}
-	case WLR_SCENE_NODE_RECT:
-		break;
-	}
-}
-
-static struct wlr_buffer *
-capture_workspace(struct workspace *workspace, struct output *output,
-		int width, int height, int ox, int oy)
-{
-	struct wlr_buffer *buf = wlr_allocator_create_buffer(
-		server.allocator, width, height,
-		&output->wlr_output->swapchain->format);
-	if (!buf) {
-		wlr_log(WLR_ERROR, "workspace transition: failed to allocate buffer");
-		return NULL;
-	}
-
-	struct wlr_render_pass *pass = wlr_renderer_begin_buffer_pass(
-		server.renderer, buf, NULL);
-	if (!pass) {
-		wlr_log(WLR_ERROR, "workspace transition: failed to begin render pass");
-		wlr_buffer_drop(buf);
-		return NULL;
-	}
-
-	render_node(pass, &output->layer_tree[0]->node, -ox, -oy);
-	render_node(pass, &workspace->tree->node, -ox, -oy);
-
-	if (!wlr_render_pass_submit(pass)) {
-		wlr_log(WLR_ERROR, "workspace transition: failed to submit render pass");
-		wlr_buffer_drop(buf);
-		return NULL;
-	}
-	return buf;
-}
-
-static void
 finish_transition(void)
 {
 	trans.active = false;
@@ -125,12 +43,19 @@ finish_transition(void)
 		wl_event_source_remove(trans.timer);
 		trans.timer = NULL;
 	}
-	if (trans.overlay) {
-		wlr_scene_node_destroy(&trans.overlay->node);
-		trans.overlay = NULL;
+	if (trans.from_overlay) {
+		wlr_scene_node_reparent(&trans.from_ws->tree->node,
+			server.workspace_tree);
+		wlr_scene_node_set_position(&trans.from_ws->tree->node, 0, 0);
+		wlr_scene_node_set_enabled(&trans.from_ws->tree->node, false);
+		wlr_scene_node_destroy(&trans.from_overlay->node);
+		trans.from_overlay = NULL;
 	}
-	trans.from_buf = NULL;
-	trans.to_buf = NULL;
+	if (trans.to_ws) {
+		wlr_scene_node_set_position(&trans.to_ws->tree->node, 0, 0);
+		trans.to_ws = NULL;
+	}
+	trans.from_ws = NULL;
 }
 
 static int
@@ -148,8 +73,8 @@ transition_tick(void *data)
 	int from_x = -trans.direction * slide;
 	int to_x = trans.direction * (trans.width - slide);
 
-	wlr_scene_node_set_position(&trans.from_buf->node, from_x, 0);
-	wlr_scene_node_set_position(&trans.to_buf->node, to_x, 0);
+	wlr_scene_node_set_position(&trans.from_overlay->node, from_x, 0);
+	wlr_scene_node_set_position(&trans.to_ws->tree->node, to_x, 0);
 	wlr_output_schedule_frame(trans.output->wlr_output);
 
 	if (raw < 1.0) {
@@ -178,48 +103,36 @@ workspace_transition_begin(struct workspace *target,
 	struct wlr_box box;
 	wlr_output_layout_get_box(server.output_layout, output->wlr_output, &box);
 	int width = box.width;
-	int height = box.height;
 
-	if (width <= 0 || height <= 0) {
+	if (width <= 0) {
 		workspaces_switch_to(target, update_focus);
 		return;
 	}
 
 	struct workspace *from = server.workspaces.current;
 
-	struct wlr_buffer *from_buffer = capture_workspace(
-		from, output, width, height, box.x, box.y);
+	/*
+	 * Reparent from->tree into an overlay raised above workspace_tree so
+	 * it can slide out independently while layer_tree[0] (wallpaper) stays
+	 * stationary at scene root.
+	 */
+	struct wlr_scene_tree *from_overlay =
+		lab_wlr_scene_tree_create(&server.scene->tree);
+	wlr_scene_node_raise_to_top(&from_overlay->node);
+	wlr_scene_node_reparent(&from->tree->node, from_overlay);
 
 	workspaces_switch_to(target, update_focus);
 
-	struct wlr_buffer *to_buffer = capture_workspace(
-		target, output, width, height, box.x, box.y);
+	/* workspaces_switch_to() disabled from->tree; re-enable for animation */
+	wlr_scene_node_set_enabled(&from->tree->node, true);
 
-	if (!from_buffer || !to_buffer) {
-		if (from_buffer) {
-			wlr_buffer_drop(from_buffer);
-		}
-		if (to_buffer) {
-			wlr_buffer_drop(to_buffer);
-		}
-		return;
-	}
-
-	trans.overlay = lab_wlr_scene_tree_create(&server.scene->tree);
-	wlr_scene_node_set_position(&trans.overlay->node, box.x, box.y);
-	wlr_scene_node_raise_to_top(&trans.overlay->node);
-
-	trans.from_buf = lab_wlr_scene_buffer_create(trans.overlay, from_buffer);
-	wlr_buffer_drop(from_buffer);
-	wlr_scene_buffer_set_dest_size(trans.from_buf, width, height);
-	wlr_scene_node_set_position(&trans.from_buf->node, 0, 0);
-
-	trans.to_buf = lab_wlr_scene_buffer_create(trans.overlay, to_buffer);
-	wlr_buffer_drop(to_buffer);
-	wlr_scene_buffer_set_dest_size(trans.to_buf, width, height);
-	wlr_scene_node_set_position(&trans.to_buf->node, direction * width, 0);
+	/* Start to->tree off-screen in the incoming direction */
+	wlr_scene_node_set_position(&target->tree->node, direction * width, 0);
 
 	trans.active = true;
+	trans.from_overlay = from_overlay;
+	trans.from_ws = from;
+	trans.to_ws = target;
 	trans.output = output;
 	trans.direction = direction;
 	trans.width = width;
