@@ -80,6 +80,8 @@ struct layout_result {
 static void overview_finish_immediate(bool focus_selected);
 static void overview_show_labels(void);
 static int ws_slide_tick(void *data);
+static void overview_create_items(struct wlr_scene_tree *content_tree,
+	struct output *output, struct wlr_box *output_box);
 
 static double
 ease_in_out_cubic(double t)
@@ -837,24 +839,10 @@ apply_packing(double area_x, double area_y, double area_width, double area_heigh
 	free(sort_items);
 }
 
-void
-overview_begin(void)
+static void
+overview_create_items(struct wlr_scene_tree *content_tree,
+		struct output *output, struct wlr_box *output_box)
 {
-	if (server.input_mode != LAB_INPUT_STATE_PASSTHROUGH) {
-		return;
-	}
-
-	struct output *output = output_nearest_to_cursor();
-	if (!output || !output_is_usable(output)) {
-		return;
-	}
-
-	/* Get output geometry */
-	struct wlr_box output_box;
-	wlr_output_layout_get_box(server.output_layout, output->wlr_output,
-		&output_box);
-
-	/* Collect all views */
 	struct wl_array views;
 	wl_array_init(&views);
 	view_array_append(&views,
@@ -864,42 +852,15 @@ overview_begin(void)
 	int count = wl_array_len(&views);
 	if (count == 0) {
 		wl_array_release(&views);
-		/* Still show background for empty workspace */
-		overview.active = true;
-		overview.output = output;
-		wl_list_init(&overview.items);
-		overview.tree = lab_wlr_scene_tree_create(&server.scene->tree);
-		wlr_scene_node_raise_to_top(&overview.tree->node);
-		wlr_scene_node_reparent(&output->layer_tree[0]->node, overview.tree);
-		wlr_scene_node_lower_to_bottom(&output->layer_tree[0]->node);
-		struct theme *theme_empty = rc.theme;
-		float bg_empty[4] = {
-			theme_empty->overview_bg_color[0],
-			theme_empty->overview_bg_color[1],
-			theme_empty->overview_bg_color[2],
-			theme_empty->overview_bg_color[3],
-		};
-		overview.background = lab_wlr_scene_rect_create(overview.tree,
-			output_box.width, output_box.height, bg_empty);
-		wlr_scene_node_set_position(&overview.background->node,
-			output_box.x, output_box.y);
-		overview.current_t = 1.0;
-		seat_focus_override_begin(&server.seat,
-			LAB_INPUT_STATE_OVERVIEW, LAB_CURSOR_DEFAULT);
-		cursor_update_focus();
 		return;
 	}
 
-	/* Calculate margins based on short side */
-	double short_side = fmin(output_box.width, output_box.height);
+	double short_side = fmin(output_box->width, output_box->height);
 	double margin = RELATIVE_MARGIN * short_side;
 	double min_length = RELATIVE_MIN_LENGTH * short_side;
+	double area_width = output_box->width - 2 * margin;
+	double area_height = output_box->height - 2 * margin;
 
-	/* Available area for layout */
-	double area_width = output_box.width - 2 * margin;
-	double area_height = output_box.height - 2 * margin;
-
-	/* Create window rects with margins */
 	struct window_rect *windows = znew_n(*windows, count);
 	struct view **view_ptr;
 	int idx = 0;
@@ -907,11 +868,8 @@ overview_begin(void)
 		struct view *v = *view_ptr;
 		double w = fmax(v->current.width, min_length) + 2 * margin;
 		double h = fmax(v->current.height, min_length) + 2 * margin;
-
-		/* Clip oversized windows */
 		w = fmin(w, 4 * area_width);
 		h = fmin(h, 4 * area_height);
-
 		windows[idx].x = v->current.x;
 		windows[idx].y = v->current.y;
 		windows[idx].width = w;
@@ -923,62 +881,20 @@ overview_begin(void)
 		idx++;
 	}
 
-	/* Find good packing */
 	struct layered_packing packing = find_good_packing(
 		area_width, area_height, windows, count);
-
-	/* Apply packing to get final positions */
 	struct layout_result *results = znew_n(*results, count);
 	apply_packing(0, 0, area_width, area_height, margin, &packing,
 		windows, count, results);
 
-	/* Initialize overview state */
-	overview.active = true;
-	overview.output = output;
-	wl_list_init(&overview.items);
-
-	/* Create overview tree */
-	overview.tree = lab_wlr_scene_tree_create(&server.scene->tree);
-	wlr_scene_node_raise_to_top(&overview.tree->node);
-
-	/* Move wallpaper into overview tree as bottommost layer */
-	wlr_scene_node_reparent(&output->layer_tree[0]->node, overview.tree);
-	wlr_scene_node_lower_to_bottom(&output->layer_tree[0]->node);
-
-	/*
-	 * Background overlay
-	 */
-	struct theme *theme = rc.theme;
-	float bg_transparent[4] = {
-		theme->overview_bg_color[0],
-		theme->overview_bg_color[1],
-		theme->overview_bg_color[2],
-		theme->overview_bg_color[3],
-	};
-	overview.background = lab_wlr_scene_rect_create(overview.tree,
-		output_box.width, output_box.height, bg_transparent);
-	wlr_scene_node_set_position(&overview.background->node,
-		output_box.x, output_box.y);
-
-	/* Create content tree positioned at usable area origin */
-	struct wlr_scene_tree *content_tree =
-		lab_wlr_scene_tree_create(overview.tree);
-	wlr_scene_node_set_position(&content_tree->node,
-		output_box.x + (int)margin,
-		output_box.y + (int)margin);
-
-	int content_origin_x = output_box.x + (int)margin;
-	int content_origin_y = output_box.y + (int)margin;
-
 	/*
 	 * Create items in reverse focus order so that the frontmost window
-	 * (windows[0]) is added last and rendered on top during animation.
-	 * windows[] is front-to-back; in the scene graph last child = top.
+	 * is added last and rendered on top.
 	 */
 	for (int i = count - 1; i >= 0; i--) {
 		struct view *v = windows[i].view;
-		int norm_x = v->current.x - content_origin_x;
-		int norm_y = v->current.y - content_origin_y;
+		int norm_x = v->current.x - overview.content_x;
+		int norm_y = v->current.y - overview.content_y;
 		int norm_w = v->current.width;
 		int norm_h = v->current.height;
 
@@ -999,11 +915,71 @@ overview_begin(void)
 	free(results);
 	free(windows);
 	wl_array_release(&views);
+}
+
+void
+overview_begin(void)
+{
+	if (server.input_mode != LAB_INPUT_STATE_PASSTHROUGH) {
+		return;
+	}
+
+	struct output *output = output_nearest_to_cursor();
+	if (!output || !output_is_usable(output)) {
+		return;
+	}
+
+	struct wlr_box output_box;
+	wlr_output_layout_get_box(server.output_layout, output->wlr_output,
+		&output_box);
+
+	overview.active = true;
+	overview.output = output;
+	wl_list_init(&overview.items);
+	wl_list_init(&overview.ws_slide_old_items);
+
+	/* Create overview tree */
+	overview.tree = lab_wlr_scene_tree_create(&server.scene->tree);
+	wlr_scene_node_raise_to_top(&overview.tree->node);
+
+	/* Move wallpaper into overview tree as bottommost layer */
+	wlr_scene_node_reparent(&output->layer_tree[0]->node, overview.tree);
+	wlr_scene_node_lower_to_bottom(&output->layer_tree[0]->node);
+
+	/* Background overlay */
+	struct theme *theme = rc.theme;
+	float bg[4] = {
+		theme->overview_bg_color[0],
+		theme->overview_bg_color[1],
+		theme->overview_bg_color[2],
+		theme->overview_bg_color[3],
+	};
+	overview.background = lab_wlr_scene_rect_create(overview.tree,
+		output_box.width, output_box.height, bg);
+	wlr_scene_node_set_position(&overview.background->node,
+		output_box.x, output_box.y);
+
+	/* Create content tree and store its position for slide use */
+	double short_side = fmin(output_box.width, output_box.height);
+	double margin = RELATIVE_MARGIN * short_side;
+	overview.content_x = output_box.x + (int)margin;
+	overview.content_y = output_box.y + (int)margin;
+	overview.content_tree = lab_wlr_scene_tree_create(overview.tree);
+	wlr_scene_node_set_position(&overview.content_tree->node,
+		overview.content_x, overview.content_y);
+
+	/* Create items for current workspace */
+	overview_create_items(overview.content_tree, output, &output_box);
 
 	seat_focus_override_begin(&server.seat,
 		LAB_INPUT_STATE_OVERVIEW, LAB_CURSOR_DEFAULT);
-
 	cursor_update_focus();
+
+	if (wl_list_empty(&overview.items)) {
+		/* Empty workspace: show background only, no animation needed */
+		overview.current_t = 1.0;
+		return;
+	}
 
 	/* Animate from normal window positions to overview positions */
 	overview.closing = false;
@@ -1021,9 +997,19 @@ overview_finish_immediate(bool focus_selected)
 
 	if (overview.ws_slide_timer) {
 		wl_event_source_remove(overview.ws_slide_timer);
+		overview.ws_slide_timer = NULL;
 	}
-	if (overview.ws_slide_overlay) {
-		wlr_scene_node_destroy(&overview.ws_slide_overlay->node);
+	/*
+	 * ws_slide_old_content is a child of overview.tree and will be
+	 * destroyed with it below.  Only free the item structs here.
+	 */
+	if (overview.ws_sliding) {
+		struct overview_item *old_item, *old_tmp;
+		wl_list_for_each_safe(old_item, old_tmp,
+				&overview.ws_slide_old_items, link) {
+			wl_list_remove(&old_item->link);
+			free(old_item);
+		}
 	}
 
 	if (overview.tree) {
@@ -1047,6 +1033,7 @@ overview_finish_immediate(bool focus_selected)
 
 	overview = (struct overview_state){0};
 	wl_list_init(&overview.items);
+	wl_list_init(&overview.ws_slide_old_items);
 
 	seat_focus_override_end(&server.seat, /*restore_focus*/ !focus_selected);
 	if (selected_view) {
@@ -1144,11 +1131,14 @@ ws_slide_tick(void *data)
 	double eased = ease_in_out_cubic(raw);
 
 	int slide = (int)(eased * overview.ws_slide_width);
-	int from_x = -overview.ws_slide_direction * slide;
-	int tree_x = overview.ws_slide_direction * (overview.ws_slide_width - slide);
+	int old_x = overview.content_x - overview.ws_slide_direction * slide;
+	int new_x = overview.content_x
+		+ overview.ws_slide_direction * (overview.ws_slide_width - slide);
 
-	wlr_scene_node_set_position(&overview.ws_slide_overlay->node, from_x, 0);
-	wlr_scene_node_set_position(&overview.tree->node, tree_x, 0);
+	wlr_scene_node_set_position(&overview.ws_slide_old_content->node,
+		old_x, overview.content_y);
+	wlr_scene_node_set_position(&overview.content_tree->node,
+		new_x, overview.content_y);
 	wlr_output_schedule_frame(overview.output->wlr_output);
 
 	if (raw < 1.0) {
@@ -1156,17 +1146,19 @@ ws_slide_tick(void *data)
 		return 0;
 	}
 
-	/* Slide complete: restore workspace tree and move wallpaper into overview */
-	wlr_scene_node_set_enabled(&server.workspaces.current->tree->node, true);
-	wlr_scene_node_reparent(&overview.output->layer_tree[0]->node, overview.tree);
-	wlr_scene_node_lower_to_bottom(&overview.output->layer_tree[0]->node);
-	wlr_scene_node_destroy(&overview.ws_slide_overlay->node);
-	overview.ws_slide_overlay = NULL;
+	/* Slide complete: snap new content to final position and clean up */
+	wlr_scene_node_set_position(&overview.content_tree->node,
+		overview.content_x, overview.content_y);
+	wlr_scene_node_destroy(&overview.ws_slide_old_content->node);
+	overview.ws_slide_old_content = NULL;
+	struct overview_item *item, *tmp;
+	wl_list_for_each_safe(item, tmp, &overview.ws_slide_old_items, link) {
+		wl_list_remove(&item->link);
+		free(item);
+	}
 	wl_event_source_remove(overview.ws_slide_timer);
 	overview.ws_slide_timer = NULL;
 	overview.ws_sliding = false;
-
-	wlr_scene_node_set_position(&overview.tree->node, 0, 0);
 
 	if (!wl_list_empty(&overview.items)) {
 		overview_show_labels();
@@ -1189,69 +1181,68 @@ overview_goto_workspace(struct workspace *target, int direction)
 		return;
 	}
 
-	/* Keep the current overview tree alive as the slide-out element */
-	struct wlr_scene_tree *old_tree = overview.tree;
-
-	/* Cancel any in-progress open/close animation */
-	if (overview.anim_timer) {
-		wl_event_source_remove(overview.anim_timer);
-	}
-
-	/* Reparent wallpaper back so the new overview can use it */
-	wlr_scene_node_reparent(&output->layer_tree[0]->node, &server.scene->tree);
-	wlr_scene_node_lower_to_bottom(&output->layer_tree[1]->node);
-	wlr_scene_node_lower_to_bottom(&output->layer_tree[0]->node);
-
-	/* Free overview item structs (scene nodes remain alive inside old_tree) */
-	struct overview_item *item, *tmp;
-	wl_list_for_each_safe(item, tmp, &overview.items, link) {
-		wl_list_remove(&item->link);
-		free(item);
-	}
-
-	/* Reset overview state without destroying old_tree */
-	overview = (struct overview_state){0};
-	wl_list_init(&overview.items);
-
-	/* Restore input mode so overview_begin() can run */
-	seat_focus_override_end(&server.seat, /*restore_focus*/ false);
-
-	/* Switch workspace and update focus to new workspace's window */
-	workspaces_switch_to(target, /*update_focus*/ true);
-
-	/* Build new overview at t=1 (items in final positions) */
-	overview_begin();
-	if (!overview.active) {
-		wlr_scene_node_destroy(&old_tree->node);
-		return;
-	}
-	if (overview.anim_timer) {
+	/* Ensure items are at t=1 (overview positions) before transitioning */
+	if (overview.animating) {
 		wl_event_source_remove(overview.anim_timer);
 		overview.anim_timer = NULL;
+		overview.animating = false;
+		overview.current_t = 1.0;
+		apply_visual_t(1.0);
 	}
-	overview.animating = false;
-	overview.current_t = 1.0;
-	apply_visual_t(1.0);
+
+	/* Hide hover/label UI from outgoing items */
+	struct overview_item *item;
+	wl_list_for_each(item, &overview.items, link) {
+		if (item->hover_border) {
+			wlr_scene_node_set_enabled(
+				&item->hover_border->tree->node, false);
+		}
+		if (item->title_label) {
+			wlr_scene_node_set_enabled(
+				&item->title_label->scene_buffer->node, false);
+		}
+	}
+	overview.hovered = NULL;
 
 	/*
-	 * Keep wallpaper stationary: undo the layer_tree[0] reparent that
-	 * overview_begin() just did. It will be moved back into overview.tree
-	 * when the slide completes.
+	 * Move current items to the old-items list so they can be freed when
+	 * the slide completes.  overview.items is cleared for new workspace items.
 	 */
-	wlr_scene_node_reparent(&output->layer_tree[0]->node, &server.scene->tree);
-	wlr_scene_node_lower_to_bottom(&output->layer_tree[1]->node);
-	wlr_scene_node_lower_to_bottom(&output->layer_tree[0]->node);
+	wl_list_init(&overview.ws_slide_old_items);
+	if (!wl_list_empty(&overview.items)) {
+		struct wl_list *h = &overview.ws_slide_old_items;
+		h->next = overview.items.next;
+		h->prev = overview.items.prev;
+		h->next->prev = h;
+		h->prev->next = h;
+	}
+	wl_list_init(&overview.items);
 
-	/* New overview starts off-screen in the travel direction */
-	wlr_scene_node_set_position(&overview.tree->node, direction * width, 0);
+	/* Current content_tree slides out; save reference before switching */
+	struct wlr_scene_tree *old_content = overview.content_tree;
 
-	/* Raise old_tree above new overview so it slides over it */
-	wlr_scene_node_raise_to_top(&old_tree->node);
+	seat_focus_override_end(&server.seat, /*restore_focus*/ false);
 
-	/* Hide workspace tree so windows don't show through the dim overlay */
-	wlr_scene_node_set_enabled(&server.workspaces.current->tree->node, false);
+	/* Switch workspace (overview.tree stays alive and raised to top) */
+	workspaces_switch_to(target, /*update_focus*/ true);
 
-	overview.ws_slide_overlay = old_tree;
+	seat_focus_override_begin(&server.seat,
+			LAB_INPUT_STATE_OVERVIEW, LAB_CURSOR_DEFAULT);
+	cursor_update_focus();
+
+	/*
+	 * Create a new content_tree for the new workspace, initially placed
+	 * off-screen in the direction of travel within overview.tree.
+	 * overview.tree (with wallpaper and background) remains stationary.
+	 */
+	overview.content_tree = lab_wlr_scene_tree_create(overview.tree);
+	wlr_scene_node_set_position(&overview.content_tree->node,
+		overview.content_x + direction * width, overview.content_y);
+
+	overview_create_items(overview.content_tree, output, &box);
+	apply_visual_t(1.0);
+
+	overview.ws_slide_old_content = old_content;
 	overview.ws_slide_direction = direction;
 	overview.ws_slide_width = width;
 	overview.ws_sliding = true;
