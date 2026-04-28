@@ -37,6 +37,8 @@ struct overview_state {
 	bool active;
 	struct wl_list items; /* struct overview_item.link */
 	struct wlr_scene_tree *tree;
+	struct wlr_scene_tree *content_tree; /* direct parent of all items */
+	int content_x, content_y;           /* position of content_tree in scene */
 	struct wlr_scene_rect *background; /* full-screen overlay for fade */
 	struct output *output;
 
@@ -55,7 +57,8 @@ struct overview_state {
 
 	/* Workspace slide (GoToDesktop during overview) */
 	bool ws_sliding;
-	struct wlr_scene_tree *ws_slide_overlay; /* old overview tree sliding out */
+	struct wlr_scene_tree *ws_slide_old_content; /* outgoing content_tree */
+	struct wl_list ws_slide_old_items;           /* items freed on completion */
 	int ws_slide_direction;
 	int ws_slide_width;
 	struct timespec ws_slide_start;
