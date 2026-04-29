@@ -4,6 +4,7 @@
 
 #include <wlr/types/wlr_output.h>
 #include "common/edge.h"
+#include "overview.h"
 
 #define LAB_NR_LAYERS (4)
 
@@ -38,6 +39,8 @@ struct output {
 	 * disconnected and connected again.
 	 */
 	uint64_t id_bit;
+
+	struct overview_state overview;
 };
 
 #undef LAB_NR_LAYERS

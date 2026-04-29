@@ -15,7 +15,6 @@
 #include <wlr/types/wlr_buffer.h>
 #include <wlr/types/wlr_output_layout.h>
 #include <wlr/types/wlr_scene.h>
-#include "common/array.h"
 #include "common/lab-scene-rect.h"
 #include "common/list.h"
 #include "common/mem.h"
@@ -43,7 +42,7 @@
 #define MAX_GAP_RATIO 1.5
 #define MAX_SCALE 1.0
 
-static struct overview_state overview;
+static struct view *pending_selected_view;
 
 /* Window rect with margins for layout calculation */
 struct window_rect {
@@ -77,11 +76,11 @@ struct layout_result {
 	double x, y, width, height;
 };
 
-static void overview_finish_immediate(bool focus_selected);
-static void overview_show_labels(void);
+static void output_overview_finish_immediate(struct output *output);
+static void output_overview_show_labels(struct output *output);
 static int ws_slide_tick(void *data);
-static void overview_create_items(struct wlr_scene_tree *content_tree,
-	struct output *output, struct wlr_box *output_box);
+static void overview_create_items(struct output *output,
+	struct wlr_box *output_box);
 
 static double
 ease_in_out_cubic(double t)
@@ -100,10 +99,10 @@ lerp_int(int a, int b, double t)
 }
 
 static void
-apply_visual_t(double t)
+apply_visual_t(struct overview_state *ov, double t)
 {
 	struct overview_item *item;
-	wl_list_for_each(item, &overview.items, link) {
+	wl_list_for_each(item, &ov->items, link) {
 		int x = lerp_int(item->normal_x, item->overview_x, t);
 		int y = lerp_int(item->normal_y, item->overview_y, t);
 		int w = lerp_int(item->normal_w, item->overview_w, t);
@@ -121,47 +120,50 @@ apply_visual_t(double t)
 static int
 animation_tick(void *data)
 {
+	struct output *output = data;
+	struct overview_state *ov = &output->overview;
+
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	double elapsed_ms =
-		(double)(now.tv_sec - overview.anim_start.tv_sec) * 1000.0
-		+ (double)(now.tv_nsec - overview.anim_start.tv_nsec) / 1.0e6;
-	double raw = fmin(1.0, elapsed_ms / (double)overview.anim_duration_ms);
+		(double)(now.tv_sec - ov->anim_start.tv_sec) * 1000.0
+		+ (double)(now.tv_nsec - ov->anim_start.tv_nsec) / 1.0e6;
+	double raw = fmin(1.0, elapsed_ms / (double)ov->anim_duration_ms);
 	double eased = ease_in_out_cubic(raw);
-	double t = overview.anim_from_t
-		+ (overview.anim_to_t - overview.anim_from_t) * eased;
+	double t = ov->anim_from_t + (ov->anim_to_t - ov->anim_from_t) * eased;
 
-	overview.current_t = t;
-	apply_visual_t(t);
-	wlr_output_schedule_frame(overview.output->wlr_output);
+	ov->current_t = t;
+	apply_visual_t(ov, t);
+	wlr_output_schedule_frame(output->wlr_output);
 
 	if (raw < 1.0) {
-		wl_event_source_timer_update(overview.anim_timer, 8);
+		wl_event_source_timer_update(ov->anim_timer, 8);
 		return 0;
 	}
 
 	/* Animation complete */
-	overview.animating = false;
-	wl_event_source_remove(overview.anim_timer);
-	overview.anim_timer = NULL;
+	ov->animating = false;
+	wl_event_source_remove(ov->anim_timer);
+	ov->anim_timer = NULL;
 
-	if (overview.closing) {
-		overview_finish_immediate(overview.focus_on_finish);
+	if (ov->closing) {
+		output_overview_finish_immediate(output);
 	} else {
-		overview_show_labels();
+		output_overview_show_labels(output);
 	}
 	return 0;
 }
 
 static void
-overview_show_labels(void)
+output_overview_show_labels(struct output *output)
 {
+	struct overview_state *ov = &output->overview;
 	struct theme *theme = rc.theme;
 	float *border_color =
 		theme->osd_window_switcher_thumbnail.item_active_border_color;
 
 	struct overview_item *item;
-	wl_list_for_each(item, &overview.items, link) {
+	wl_list_for_each(item, &ov->items, link) {
 		int w = item->overview_w;
 		int h = item->overview_h;
 
@@ -200,56 +202,59 @@ overview_show_labels(void)
 void
 overview_on_cursor_motion(struct wlr_scene_node *node)
 {
-	if (!overview.active || overview.animating || overview.ws_sliding) {
-		return;
-	}
-
 	struct overview_item *hovered = NULL;
 	if (node) {
 		hovered = node_overview_item_from_node(node);
 	}
 
-	if (overview.hovered == hovered) {
-		return;
-	}
-
-	if (overview.hovered && overview.hovered->hover_border) {
-		wlr_scene_node_set_enabled(
-			&overview.hovered->hover_border->tree->node, false);
-	}
-
-	overview.hovered = hovered;
-
-	if (hovered && hovered->hover_border) {
-		wlr_scene_node_set_enabled(
-			&hovered->hover_border->tree->node, true);
+	struct output *output;
+	wl_list_for_each(output, &server.outputs, link) {
+		struct overview_state *ov = &output->overview;
+		if (!ov->active || ov->animating || ov->ws_sliding) {
+			continue;
+		}
+		struct overview_item *new_hov =
+			(hovered && hovered->output == output) ? hovered : NULL;
+		if (ov->hovered == new_hov) {
+			continue;
+		}
+		if (ov->hovered && ov->hovered->hover_border) {
+			wlr_scene_node_set_enabled(
+				&ov->hovered->hover_border->tree->node, false);
+		}
+		ov->hovered = new_hov;
+		if (ov->hovered && ov->hovered->hover_border) {
+			wlr_scene_node_set_enabled(
+				&ov->hovered->hover_border->tree->node, true);
+		}
 	}
 }
 
 static void
-start_animation(double from_t, double to_t)
+start_animation(struct output *output, double from_t, double to_t)
 {
+	struct overview_state *ov = &output->overview;
 	double distance = fabs(to_t - from_t);
 	if (distance < 0.001) {
-		overview.current_t = to_t;
-		apply_visual_t(to_t);
-		if (overview.closing) {
-			overview_finish_immediate(overview.focus_on_finish);
+		ov->current_t = to_t;
+		apply_visual_t(ov, to_t);
+		if (ov->closing) {
+			output_overview_finish_immediate(output);
 		}
 		return;
 	}
 
-	overview.animating = true;
-	overview.anim_from_t = from_t;
-	overview.anim_to_t = to_t;
-	overview.anim_duration_ms = (uint32_t)(distance * OVERVIEW_ANIM_MS);
-	clock_gettime(CLOCK_MONOTONIC, &overview.anim_start);
+	ov->animating = true;
+	ov->anim_from_t = from_t;
+	ov->anim_to_t = to_t;
+	ov->anim_duration_ms = (uint32_t)(distance * OVERVIEW_ANIM_MS);
+	clock_gettime(CLOCK_MONOTONIC, &ov->anim_start);
 
-	if (!overview.anim_timer) {
-		overview.anim_timer = wl_event_loop_add_timer(
-			server.wl_event_loop, animation_tick, NULL);
+	if (!ov->anim_timer) {
+		ov->anim_timer = wl_event_loop_add_timer(
+			server.wl_event_loop, animation_tick, output);
 	}
-	wl_event_source_timer_update(overview.anim_timer, 1);
+	wl_event_source_timer_update(ov->anim_timer, 1);
 }
 
 static void
@@ -353,16 +358,18 @@ node_overview_item_from_node(struct wlr_scene_node *wlr_scene_node)
 }
 
 static struct overview_item *
-create_item_at(struct wlr_scene_tree *parent, struct view *view,
-		struct output *output, int x, int y, int width, int height)
+create_item_at(struct output *output, struct view *view,
+		int x, int y, int width, int height)
 {
+	struct overview_state *ov = &output->overview;
 	struct overview_item *item = znew(*item);
-	wl_list_append(&overview.items, &item->link);
+	wl_list_append(&ov->items, &item->link);
 
-	struct wlr_scene_tree *tree = lab_wlr_scene_tree_create(parent);
+	struct wlr_scene_tree *tree = lab_wlr_scene_tree_create(ov->content_tree);
 	node_descriptor_create(&tree->node, LAB_NODE_OVERVIEW_ITEM, view, item);
 	item->tree = tree;
 	item->view = view;
+	item->output = output;
 
 	wlr_scene_node_set_position(&tree->node, x, y);
 
@@ -840,18 +847,26 @@ apply_packing(double area_x, double area_y, double area_width, double area_heigh
 }
 
 static void
-overview_create_items(struct wlr_scene_tree *content_tree,
-		struct output *output, struct wlr_box *output_box)
+overview_create_items(struct output *output, struct wlr_box *output_box)
 {
-	struct wl_array views;
-	wl_array_init(&views);
-	view_array_append(&views,
+	struct overview_state *ov = &output->overview;
+
+	struct wl_array all_views;
+	wl_array_init(&all_views);
+	view_array_append(&all_views,
 		LAB_VIEW_CRITERIA_CURRENT_WORKSPACE
 		| LAB_VIEW_CRITERIA_NO_SKIP_WINDOW_SWITCHER);
 
-	int count = wl_array_len(&views);
+	/* Count views whose primary output matches this output */
+	int count = 0;
+	struct view **view_ptr;
+	wl_array_for_each(view_ptr, &all_views) {
+		if ((*view_ptr)->output == output) {
+			count++;
+		}
+	}
 	if (count == 0) {
-		wl_array_release(&views);
+		wl_array_release(&all_views);
 		return;
 	}
 
@@ -862,10 +877,12 @@ overview_create_items(struct wlr_scene_tree *content_tree,
 	double area_height = output_box->height - 2 * margin;
 
 	struct window_rect *windows = znew_n(*windows, count);
-	struct view **view_ptr;
 	int idx = 0;
-	wl_array_for_each(view_ptr, &views) {
+	wl_array_for_each(view_ptr, &all_views) {
 		struct view *v = *view_ptr;
+		if (v->output != output) {
+			continue;
+		}
 		double w = fmax(v->current.width, min_length) + 2 * margin;
 		double h = fmax(v->current.height, min_length) + 2 * margin;
 		w = fmin(w, 4 * area_width);
@@ -893,13 +910,13 @@ overview_create_items(struct wlr_scene_tree *content_tree,
 	 */
 	for (int i = count - 1; i >= 0; i--) {
 		struct view *v = windows[i].view;
-		int norm_x = v->current.x - overview.content_x;
-		int norm_y = v->current.y - overview.content_y;
+		int norm_x = v->current.x - ov->content_x;
+		int norm_y = v->current.y - ov->content_y;
 		int norm_w = v->current.width;
 		int norm_h = v->current.height;
 
-		struct overview_item *item = create_item_at(content_tree, v,
-			output, norm_x, norm_y, norm_w, norm_h);
+		struct overview_item *item = create_item_at(output, v,
+			norm_x, norm_y, norm_w, norm_h);
 
 		item->normal_x = norm_x;
 		item->normal_y = norm_y;
@@ -914,150 +931,76 @@ overview_create_items(struct wlr_scene_tree *content_tree,
 	free_packing(&packing);
 	free(results);
 	free(windows);
-	wl_array_release(&views);
-}
-
-void
-overview_begin(void)
-{
-	if (server.input_mode != LAB_INPUT_STATE_PASSTHROUGH) {
-		return;
-	}
-
-	struct output *output = output_nearest_to_cursor();
-	if (!output || !output_is_usable(output)) {
-		return;
-	}
-
-	struct wlr_box output_box;
-	wlr_output_layout_get_box(server.output_layout, output->wlr_output,
-		&output_box);
-
-	overview.active = true;
-	overview.output = output;
-	wl_list_init(&overview.items);
-	wl_list_init(&overview.ws_slide_old_items);
-
-	/* Create overview tree */
-	overview.tree = lab_wlr_scene_tree_create(&server.scene->tree);
-	wlr_scene_node_raise_to_top(&overview.tree->node);
-
-	/* Move wallpaper into overview tree as bottommost layer */
-	wlr_scene_node_reparent(&output->layer_tree[0]->node, overview.tree);
-	wlr_scene_node_lower_to_bottom(&output->layer_tree[0]->node);
-
-	/* Background overlay */
-	struct theme *theme = rc.theme;
-	float bg[4] = {
-		theme->overview_bg_color[0],
-		theme->overview_bg_color[1],
-		theme->overview_bg_color[2],
-		theme->overview_bg_color[3],
-	};
-	overview.background = lab_wlr_scene_rect_create(overview.tree,
-		output_box.width, output_box.height, bg);
-	wlr_scene_node_set_position(&overview.background->node,
-		output_box.x, output_box.y);
-
-	/* Create content tree and store its position for slide use */
-	double short_side = fmin(output_box.width, output_box.height);
-	double margin = RELATIVE_MARGIN * short_side;
-	overview.content_x = output_box.x + (int)margin;
-	overview.content_y = output_box.y + (int)margin;
-	overview.content_tree = lab_wlr_scene_tree_create(overview.tree);
-	wlr_scene_node_set_position(&overview.content_tree->node,
-		overview.content_x, overview.content_y);
-
-	/* Create items for current workspace */
-	overview_create_items(overview.content_tree, output, &output_box);
-
-	seat_focus_override_begin(&server.seat,
-		LAB_INPUT_STATE_OVERVIEW, LAB_CURSOR_DEFAULT);
-	cursor_update_focus();
-
-	if (wl_list_empty(&overview.items)) {
-		/* Empty workspace: show background only, no animation needed */
-		overview.current_t = 1.0;
-		return;
-	}
-
-	/* Animate from normal window positions to overview positions */
-	overview.closing = false;
-	overview.current_t = 0.0;
-	start_animation(0.0, 1.0);
+	wl_array_release(&all_views);
 }
 
 static void
-overview_finish_immediate(bool focus_selected)
+output_overview_finish_immediate(struct output *output)
 {
-	if (overview.anim_timer) {
-		wl_event_source_remove(overview.anim_timer);
-		overview.anim_timer = NULL;
+	struct overview_state *ov = &output->overview;
+
+	if (ov->anim_timer) {
+		wl_event_source_remove(ov->anim_timer);
+		ov->anim_timer = NULL;
 	}
 
-	if (overview.ws_slide_timer) {
-		wl_event_source_remove(overview.ws_slide_timer);
-		overview.ws_slide_timer = NULL;
+	if (ov->ws_slide_timer) {
+		wl_event_source_remove(ov->ws_slide_timer);
+		ov->ws_slide_timer = NULL;
 	}
+
 	/*
-	 * ws_slide_old_content is a child of overview.tree and will be
+	 * ws_slide_old_content is a child of ov->tree and will be
 	 * destroyed with it below.  Only free the item structs here.
 	 */
-	if (overview.ws_sliding) {
-		struct overview_item *old_item, *old_tmp;
-		wl_list_for_each_safe(old_item, old_tmp,
-				&overview.ws_slide_old_items, link) {
-			wl_list_remove(&old_item->link);
-			free(old_item);
-		}
+	struct overview_item *old_item, *old_tmp;
+	wl_list_for_each_safe(old_item, old_tmp,
+			&ov->ws_slide_old_items, link) {
+		wl_list_remove(&old_item->link);
+		free(old_item);
 	}
 
-	if (overview.tree) {
+	if (ov->tree) {
 		/* Restore wallpaper to scene root before destroying overview tree */
-		wlr_scene_node_reparent(&overview.output->layer_tree[0]->node,
+		wlr_scene_node_reparent(&output->layer_tree[0]->node,
 			&server.scene->tree);
 		wlr_scene_node_lower_to_bottom(
-			&overview.output->layer_tree[1]->node);
+			&output->layer_tree[1]->node);
 		wlr_scene_node_lower_to_bottom(
-			&overview.output->layer_tree[0]->node);
-		wlr_scene_node_destroy(&overview.tree->node);
+			&output->layer_tree[0]->node);
+		wlr_scene_node_destroy(&ov->tree->node);
 	}
 
 	struct overview_item *item, *tmp;
-	wl_list_for_each_safe(item, tmp, &overview.items, link) {
+	wl_list_for_each_safe(item, tmp, &ov->items, link) {
 		wl_list_remove(&item->link);
 		free(item);
 	}
 
-	struct view *selected_view = focus_selected ? overview.selected_view : NULL;
+	*ov = (struct overview_state){0};
+	/* active is now false */
 
-	overview = (struct overview_state){0};
-	wl_list_init(&overview.items);
-	wl_list_init(&overview.ws_slide_old_items);
-
-	seat_focus_override_end(&server.seat, /*restore_focus*/ !focus_selected);
-	if (selected_view) {
-		desktop_focus_view(selected_view, /*raise*/ true);
+	if (!overview_is_active()) {
+		seat_focus_override_end(&server.seat,
+			/*restore_focus*/ !pending_selected_view);
+		if (pending_selected_view) {
+			desktop_focus_view(pending_selected_view, /*raise*/ true);
+		}
+		pending_selected_view = NULL;
+		cursor_update_focus();
 	}
-	cursor_update_focus();
 }
 
-void
-overview_finish(bool focus_selected)
+static void
+output_overview_start_close(struct output *output)
 {
-	if (!overview.active) {
-		return;
-	}
-	if (overview.closing || overview.ws_sliding) {
-		return;
-	}
+	struct overview_state *ov = &output->overview;
 
-	overview.closing = true;
-	overview.focus_on_finish = focus_selected;
+	ov->closing = true;
 
 	/* Hide labels and borders immediately when close starts */
 	struct overview_item *item;
-	wl_list_for_each(item, &overview.items, link) {
+	wl_list_for_each(item, &ov->items, link) {
 		if (item->hover_border) {
 			wlr_scene_node_set_enabled(
 				&item->hover_border->tree->node, false);
@@ -1068,21 +1011,132 @@ overview_finish(bool focus_selected)
 		}
 	}
 
-	if (overview.animating) {
+	if (ov->animating) {
 		/*
 		 * Reverse mid-open animation. Mirror the raw progress so the
 		 * visual position stays continuous (approximate for cubic easing
 		 * but imperceptible at this timescale).
 		 */
-		double midpoint = overview.current_t;
-		if (overview.anim_timer) {
-			wl_event_source_remove(overview.anim_timer);
-			overview.anim_timer = NULL;
+		double midpoint = ov->current_t;
+		if (ov->anim_timer) {
+			wl_event_source_remove(ov->anim_timer);
+			ov->anim_timer = NULL;
 		}
-		overview.animating = false;
-		start_animation(midpoint, 0.0);
+		ov->animating = false;
+		start_animation(output, midpoint, 0.0);
 	} else {
-		start_animation(overview.current_t, 0.0);
+		start_animation(output, ov->current_t, 0.0);
+	}
+}
+
+static void
+output_overview_begin_one(struct output *output)
+{
+	struct overview_state *ov = &output->overview;
+
+	struct wlr_box output_box;
+	wlr_output_layout_get_box(server.output_layout, output->wlr_output,
+		&output_box);
+
+	ov->active = true;
+	wl_list_init(&ov->items);
+	wl_list_init(&ov->ws_slide_old_items);
+
+	/* Create overview tree */
+	ov->tree = lab_wlr_scene_tree_create(&server.scene->tree);
+	wlr_scene_node_raise_to_top(&ov->tree->node);
+
+	/* Move wallpaper into overview tree as bottommost layer */
+	wlr_scene_node_reparent(&output->layer_tree[0]->node, ov->tree);
+	wlr_scene_node_lower_to_bottom(&output->layer_tree[0]->node);
+
+	/* Background overlay */
+	struct theme *theme = rc.theme;
+	float bg[4] = {
+		theme->overview_bg_color[0],
+		theme->overview_bg_color[1],
+		theme->overview_bg_color[2],
+		theme->overview_bg_color[3],
+	};
+	ov->background = lab_wlr_scene_rect_create(ov->tree,
+		output_box.width, output_box.height, bg);
+	wlr_scene_node_set_position(&ov->background->node,
+		output_box.x, output_box.y);
+
+	/* Create content tree and store its position for slide use */
+	double short_side = fmin(output_box.width, output_box.height);
+	double margin = RELATIVE_MARGIN * short_side;
+	ov->content_x = output_box.x + (int)margin;
+	ov->content_y = output_box.y + (int)margin;
+	ov->content_tree = lab_wlr_scene_tree_create(ov->tree);
+	wlr_scene_node_set_position(&ov->content_tree->node,
+		ov->content_x, ov->content_y);
+
+	/* Create items for current workspace */
+	overview_create_items(output, &output_box);
+
+	if (wl_list_empty(&ov->items)) {
+		/* Empty workspace: show background only, no animation needed */
+		ov->current_t = 1.0;
+		return;
+	}
+
+	/* Animate from normal window positions to overview positions */
+	ov->closing = false;
+	ov->current_t = 0.0;
+	start_animation(output, 0.0, 1.0);
+}
+
+void
+overview_begin(void)
+{
+	if (server.input_mode != LAB_INPUT_STATE_PASSTHROUGH) {
+		return;
+	}
+
+	bool any = false;
+	struct output *output;
+	wl_list_for_each(output, &server.outputs, link) {
+		if (output_is_usable(output)) {
+			output_overview_begin_one(output);
+			any = true;
+		}
+	}
+	if (!any) {
+		return;
+	}
+
+	seat_focus_override_begin(&server.seat,
+		LAB_INPUT_STATE_OVERVIEW, LAB_CURSOR_DEFAULT);
+	cursor_update_focus();
+}
+
+void
+overview_finish(bool focus_selected)
+{
+	if (!overview_is_active()) {
+		return;
+	}
+
+	pending_selected_view = NULL;
+	struct output *output;
+	wl_list_for_each(output, &server.outputs, link) {
+		struct overview_state *ov = &output->overview;
+		if (!ov->active) {
+			continue;
+		}
+		if (ov->closing || ov->ws_sliding) {
+			return;
+		}
+		if (focus_selected && !pending_selected_view) {
+			pending_selected_view = ov->selected_view;
+		}
+	}
+
+	wl_list_for_each(output, &server.outputs, link) {
+		if (output->overview.active) {
+			output_overview_start_close(output);
+		}
 	}
 }
 
@@ -1098,7 +1152,7 @@ overview_on_cursor_release(struct wlr_scene_node *node)
 	 * visually in the foreground during the close animation.
 	 */
 	wlr_scene_node_raise_to_top(&item->tree->node);
-	overview.selected_view = item->view;
+	item->output->overview.selected_view = item->view;
 
 	overview_finish(/*focus_selected*/ true);
 }
@@ -1106,7 +1160,7 @@ overview_on_cursor_release(struct wlr_scene_node *node)
 void
 overview_toggle(void)
 {
-	if (overview.active) {
+	if (overview_is_active()) {
 		overview_finish(/*focus_selected*/ false);
 	} else {
 		overview_begin();
@@ -1116,52 +1170,61 @@ overview_toggle(void)
 bool
 overview_is_active(void)
 {
-	return overview.active;
+	struct output *output;
+	wl_list_for_each(output, &server.outputs, link) {
+		if (output->overview.active) {
+			return true;
+		}
+	}
+	return false;
 }
 
 static int
 ws_slide_tick(void *data)
 {
+	struct output *output = data;
+	struct overview_state *ov = &output->overview;
+
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	double elapsed_ms =
-		(double)(now.tv_sec - overview.ws_slide_start.tv_sec) * 1000.0
-		+ (double)(now.tv_nsec - overview.ws_slide_start.tv_nsec) / 1.0e6;
+		(double)(now.tv_sec - ov->ws_slide_start.tv_sec) * 1000.0
+		+ (double)(now.tv_nsec - ov->ws_slide_start.tv_nsec) / 1.0e6;
 	double raw = fmin(1.0, elapsed_ms / (double)OVERVIEW_ANIM_MS);
 	double eased = ease_in_out_cubic(raw);
 
-	int slide = (int)(eased * overview.ws_slide_width);
-	int old_x = overview.content_x - overview.ws_slide_direction * slide;
-	int new_x = overview.content_x
-		+ overview.ws_slide_direction * (overview.ws_slide_width - slide);
+	int slide = (int)(eased * ov->ws_slide_width);
+	int old_x = ov->content_x - ov->ws_slide_direction * slide;
+	int new_x = ov->content_x
+		+ ov->ws_slide_direction * (ov->ws_slide_width - slide);
 
-	wlr_scene_node_set_position(&overview.ws_slide_old_content->node,
-		old_x, overview.content_y);
-	wlr_scene_node_set_position(&overview.content_tree->node,
-		new_x, overview.content_y);
-	wlr_output_schedule_frame(overview.output->wlr_output);
+	wlr_scene_node_set_position(&ov->ws_slide_old_content->node,
+		old_x, ov->content_y);
+	wlr_scene_node_set_position(&ov->content_tree->node,
+		new_x, ov->content_y);
+	wlr_output_schedule_frame(output->wlr_output);
 
 	if (raw < 1.0) {
-		wl_event_source_timer_update(overview.ws_slide_timer, 8);
+		wl_event_source_timer_update(ov->ws_slide_timer, 8);
 		return 0;
 	}
 
 	/* Slide complete: snap new content to final position and clean up */
-	wlr_scene_node_set_position(&overview.content_tree->node,
-		overview.content_x, overview.content_y);
-	wlr_scene_node_destroy(&overview.ws_slide_old_content->node);
-	overview.ws_slide_old_content = NULL;
+	wlr_scene_node_set_position(&ov->content_tree->node,
+		ov->content_x, ov->content_y);
+	wlr_scene_node_destroy(&ov->ws_slide_old_content->node);
+	ov->ws_slide_old_content = NULL;
 	struct overview_item *item, *tmp;
-	wl_list_for_each_safe(item, tmp, &overview.ws_slide_old_items, link) {
+	wl_list_for_each_safe(item, tmp, &ov->ws_slide_old_items, link) {
 		wl_list_remove(&item->link);
 		free(item);
 	}
-	wl_event_source_remove(overview.ws_slide_timer);
-	overview.ws_slide_timer = NULL;
-	overview.ws_sliding = false;
+	wl_event_source_remove(ov->ws_slide_timer);
+	ov->ws_slide_timer = NULL;
+	ov->ws_sliding = false;
 
-	if (!wl_list_empty(&overview.items)) {
-		overview_show_labels();
+	if (!wl_list_empty(&ov->items)) {
+		output_overview_show_labels(output);
 	}
 	return 0;
 }
@@ -1169,127 +1232,162 @@ ws_slide_tick(void *data)
 void
 overview_goto_workspace(struct workspace *target, int direction)
 {
-	if (!overview.active || overview.ws_sliding) {
+	if (!overview_is_active()) {
 		return;
 	}
-
-	struct output *output = overview.output;
-	struct wlr_box box;
-	wlr_output_layout_get_box(server.output_layout, output->wlr_output, &box);
-	int width = box.width;
-	if (width <= 0) {
-		return;
-	}
-
-	/* Ensure items are at t=1 (overview positions) before transitioning */
-	if (overview.animating) {
-		wl_event_source_remove(overview.anim_timer);
-		overview.anim_timer = NULL;
-		overview.animating = false;
-		overview.current_t = 1.0;
-		apply_visual_t(1.0);
-	}
-
-	/* Hide hover/label UI from outgoing items */
-	struct overview_item *item;
-	wl_list_for_each(item, &overview.items, link) {
-		if (item->hover_border) {
-			wlr_scene_node_set_enabled(
-				&item->hover_border->tree->node, false);
-		}
-		if (item->title_label) {
-			wlr_scene_node_set_enabled(
-				&item->title_label->scene_buffer->node, false);
-		}
-	}
-	overview.hovered = NULL;
 
 	/*
-	 * Move current items to the old-items list so they can be freed when
-	 * the slide completes.  overview.items is cleared for new workspace items.
+	 * Phase 1: for each active output, snap animation, hide labels,
+	 * move items to ws_slide_old_items, save old content_tree.
 	 */
-	wl_list_init(&overview.ws_slide_old_items);
-	if (!wl_list_empty(&overview.items)) {
-		struct wl_list *h = &overview.ws_slide_old_items;
-		h->next = overview.items.next;
-		h->prev = overview.items.prev;
-		h->next->prev = h;
-		h->prev->next = h;
+	struct output *output;
+	wl_list_for_each(output, &server.outputs, link) {
+		struct overview_state *ov = &output->overview;
+		if (!ov->active || ov->ws_sliding) {
+			continue;
+		}
+
+		struct wlr_box box;
+		wlr_output_layout_get_box(server.output_layout,
+			output->wlr_output, &box);
+		if (box.width <= 0) {
+			continue;
+		}
+
+		/* Ensure items are at t=1 (overview positions) before transitioning */
+		if (ov->animating) {
+			wl_event_source_remove(ov->anim_timer);
+			ov->anim_timer = NULL;
+			ov->animating = false;
+			ov->current_t = 1.0;
+			apply_visual_t(ov, 1.0);
+		}
+
+		/* Hide hover/label UI from outgoing items */
+		struct overview_item *item;
+		wl_list_for_each(item, &ov->items, link) {
+			if (item->hover_border) {
+				wlr_scene_node_set_enabled(
+					&item->hover_border->tree->node, false);
+			}
+			if (item->title_label) {
+				wlr_scene_node_set_enabled(
+					&item->title_label->scene_buffer->node, false);
+			}
+		}
+		ov->hovered = NULL;
+
+		/*
+		 * Move current items to the old-items list so they can be freed
+		 * when the slide completes. ov->items is cleared for new items.
+		 */
+		wl_list_init(&ov->ws_slide_old_items);
+		if (!wl_list_empty(&ov->items)) {
+			struct wl_list *h = &ov->ws_slide_old_items;
+			h->next = ov->items.next;
+			h->prev = ov->items.prev;
+			h->next->prev = h;
+			h->prev->next = h;
+		}
+		wl_list_init(&ov->items);
+
+		/* Save outgoing content_tree reference */
+		ov->ws_slide_old_content = ov->content_tree;
+		ov->content_tree = NULL;
 	}
-	wl_list_init(&overview.items);
 
-	/* Current content_tree slides out; save reference before switching */
-	struct wlr_scene_tree *old_content = overview.content_tree;
-
+	/* Phase transition: switch workspace */
 	seat_focus_override_end(&server.seat, /*restore_focus*/ false);
-
-	/* Switch workspace (overview.tree stays alive and raised to top) */
 	workspaces_switch_to(target, /*update_focus*/ true);
-
 	seat_focus_override_begin(&server.seat,
-			LAB_INPUT_STATE_OVERVIEW, LAB_CURSOR_DEFAULT);
+		LAB_INPUT_STATE_OVERVIEW, LAB_CURSOR_DEFAULT);
 	cursor_update_focus();
 
 	/*
-	 * Create a new content_tree for the new workspace, initially placed
-	 * off-screen in the direction of travel within overview.tree.
-	 * overview.tree (with wallpaper and background) remains stationary.
+	 * Phase 2: for each active output that has a saved old_content,
+	 * create new content_tree at offset position, populate items,
+	 * and start the slide timer.
 	 */
-	overview.content_tree = lab_wlr_scene_tree_create(overview.tree);
-	wlr_scene_node_set_position(&overview.content_tree->node,
-		overview.content_x + direction * width, overview.content_y);
+	wl_list_for_each(output, &server.outputs, link) {
+		struct overview_state *ov = &output->overview;
+		if (!ov->active || !ov->ws_slide_old_content) {
+			continue;
+		}
 
-	overview_create_items(overview.content_tree, output, &box);
-	apply_visual_t(1.0);
+		struct wlr_box box;
+		wlr_output_layout_get_box(server.output_layout,
+			output->wlr_output, &box);
 
-	overview.ws_slide_old_content = old_content;
-	overview.ws_slide_direction = direction;
-	overview.ws_slide_width = width;
-	overview.ws_sliding = true;
-	clock_gettime(CLOCK_MONOTONIC, &overview.ws_slide_start);
-	overview.ws_slide_timer = wl_event_loop_add_timer(
-		server.wl_event_loop, ws_slide_tick, NULL);
-	wl_event_source_timer_update(overview.ws_slide_timer, 1);
+		/*
+		 * Create a new content_tree for the new workspace, initially
+		 * placed off-screen in the direction of travel within ov->tree.
+		 * ov->tree (with wallpaper and background) remains stationary.
+		 */
+		ov->content_tree = lab_wlr_scene_tree_create(ov->tree);
+		wlr_scene_node_set_position(&ov->content_tree->node,
+			ov->content_x + direction * box.width, ov->content_y);
+
+		overview_create_items(output, &box);
+		apply_visual_t(ov, 1.0);
+
+		ov->ws_slide_direction = direction;
+		ov->ws_slide_width = box.width;
+		ov->ws_sliding = true;
+		clock_gettime(CLOCK_MONOTONIC, &ov->ws_slide_start);
+		ov->ws_slide_timer = wl_event_loop_add_timer(
+			server.wl_event_loop, ws_slide_tick, output);
+		wl_event_source_timer_update(ov->ws_slide_timer, 1);
+	}
 }
 
 void
 overview_on_view_destroy(struct view *view)
 {
-	if (!overview.active) {
-		return;
+	if (pending_selected_view == view) {
+		pending_selected_view = NULL;
 	}
 
-	if (overview.selected_view == view) {
-		overview.selected_view = NULL;
-	}
-	if (overview.hovered && overview.hovered->view == view) {
-		overview.hovered = NULL;
-	}
+	struct output *output;
+	wl_list_for_each(output, &server.outputs, link) {
+		struct overview_state *ov = &output->overview;
+		if (!ov->active) {
+			continue;
+		}
 
-	struct overview_item *item, *tmp;
-	wl_list_for_each_safe(item, tmp, &overview.items, link) {
-		if (item->view == view) {
-			wlr_scene_node_destroy(&item->tree->node);
-			wl_list_remove(&item->link);
-			free(item);
-			return;
+		if (ov->selected_view == view) {
+			ov->selected_view = NULL;
 		}
-	}
-	wl_list_for_each_safe(item, tmp, &overview.ws_slide_old_items, link) {
-		if (item->view == view) {
-			wlr_scene_node_destroy(&item->tree->node);
-			wl_list_remove(&item->link);
-			free(item);
-			return;
+		if (ov->hovered && ov->hovered->view == view) {
+			ov->hovered = NULL;
 		}
+
+		struct overview_item *item, *tmp;
+		wl_list_for_each_safe(item, tmp, &ov->items, link) {
+			if (item->view == view) {
+				wlr_scene_node_destroy(&item->tree->node);
+				wl_list_remove(&item->link);
+				free(item);
+				goto next_output;
+			}
+		}
+		wl_list_for_each_safe(item, tmp, &ov->ws_slide_old_items, link) {
+			if (item->view == view) {
+				wlr_scene_node_destroy(&item->tree->node);
+				wl_list_remove(&item->link);
+				free(item);
+				goto next_output;
+			}
+		}
+next_output:
+		;
 	}
 }
 
 void
 overview_on_output_destroy(struct output *output)
 {
-	if (!overview.active || overview.output != output) {
+	if (!output->overview.active) {
 		return;
 	}
-	overview_finish_immediate(/*focus_selected*/ false);
+	output_overview_finish_immediate(output);
 }
