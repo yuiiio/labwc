@@ -90,4 +90,7 @@ struct overview_item *node_overview_item_from_node(
 /* Switch to target workspace with sliding animation while overview is active */
 void overview_goto_workspace(struct workspace *target, int direction);
 
+/* Clean up references to a view being destroyed */
+void overview_on_view_destroy(struct view *view);
+
 #endif /* LABWC_OVERVIEW_H */
