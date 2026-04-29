@@ -93,4 +93,7 @@ void overview_goto_workspace(struct workspace *target, int direction);
 /* Clean up references to a view being destroyed */
 void overview_on_view_destroy(struct view *view);
 
+/* Cancel overview if it is running on the given output */
+void overview_on_output_destroy(struct output *output);
+
 #endif /* LABWC_OVERVIEW_H */

@@ -33,6 +33,7 @@
 #include "output-virtual.h"
 #include "regions.h"
 #include "session-lock.h"
+#include "overview.h"
 #include "view.h"
 #include "xwayland.h"
 
@@ -139,6 +140,7 @@ handle_output_destroy(struct wl_listener *listener, void *data)
 	wl_list_remove(&output->request_state.link);
 	seat_output_layout_changed(seat);
 
+	overview_on_output_destroy(output);
 	for (size_t i = 0; i < ARRAY_SIZE(output->layer_tree); i++) {
 		wlr_scene_node_destroy(&output->layer_tree[i]->node);
 	}

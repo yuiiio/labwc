@@ -1277,9 +1277,19 @@ overview_on_view_destroy(struct view *view)
 	}
 	wl_list_for_each_safe(item, tmp, &overview.ws_slide_old_items, link) {
 		if (item->view == view) {
+			wlr_scene_node_destroy(&item->tree->node);
 			wl_list_remove(&item->link);
 			free(item);
 			return;
 		}
 	}
+}
+
+void
+overview_on_output_destroy(struct output *output)
+{
+	if (!overview.active || overview.output != output) {
+		return;
+	}
+	overview_finish_immediate(/*focus_selected*/ false);
 }
