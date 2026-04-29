@@ -1251,3 +1251,35 @@ overview_goto_workspace(struct workspace *target, int direction)
 		server.wl_event_loop, ws_slide_tick, NULL);
 	wl_event_source_timer_update(overview.ws_slide_timer, 1);
 }
+
+void
+overview_on_view_destroy(struct view *view)
+{
+	if (!overview.active) {
+		return;
+	}
+
+	if (overview.selected_view == view) {
+		overview.selected_view = NULL;
+	}
+	if (overview.hovered && overview.hovered->view == view) {
+		overview.hovered = NULL;
+	}
+
+	struct overview_item *item, *tmp;
+	wl_list_for_each_safe(item, tmp, &overview.items, link) {
+		if (item->view == view) {
+			wlr_scene_node_destroy(&item->tree->node);
+			wl_list_remove(&item->link);
+			free(item);
+			return;
+		}
+	}
+	wl_list_for_each_safe(item, tmp, &overview.ws_slide_old_items, link) {
+		if (item->view == view) {
+			wl_list_remove(&item->link);
+			free(item);
+			return;
+		}
+	}
+}

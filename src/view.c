@@ -22,6 +22,7 @@
 #include "labwc.h"
 #include "menu/menu.h"
 #include "output.h"
+#include "overview.h"
 #include "placement.h"
 #include "regions.h"
 #include "resize-indicator.h"
@@ -2536,6 +2537,7 @@ view_destroy(struct view *view)
 
 	clear_last_placement(view);
 	view_set_icon(view, NULL, NULL);
+	overview_on_view_destroy(view);
 	menu_on_view_destroy(view);
 
 	/*
