@@ -19,6 +19,7 @@ struct wlr_scene_tree;
 
 struct overview_item {
 	struct view *view;
+	struct output *output;                  /* the output this item belongs to */
 	struct wlr_scene_tree *tree;
 	struct lab_scene_rect *border;          /* border rect for resize */
 	struct wlr_scene_rect *hitbox;          /* invisible hitbox for resize */
@@ -40,12 +41,10 @@ struct overview_state {
 	struct wlr_scene_tree *content_tree; /* direct parent of all items */
 	int content_x, content_y;           /* position of content_tree in scene */
 	struct wlr_scene_rect *background; /* full-screen overlay for fade */
-	struct output *output;
 
 	/* Animation */
 	bool animating;
 	bool closing;           /* true = animating toward t=0 (normal) */
-	bool focus_on_finish;   /* focus selected view when close completes */
 	struct view *selected_view;      /* view to focus when close animation ends */
 	struct overview_item *hovered;   /* currently hovered item */
 	double current_t;       /* current visual progress [0=normal, 1=overview] */
