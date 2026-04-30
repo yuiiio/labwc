@@ -1236,14 +1236,20 @@ overview_goto_workspace(struct workspace *target, int direction)
 		return;
 	}
 
+	struct output *output;
+	wl_list_for_each(output, &server.outputs, link) {
+		if (output->overview.ws_sliding) {
+			return;
+		}
+	}
+
 	/*
 	 * Phase 1: for each active output, snap animation, hide labels,
 	 * move items to ws_slide_old_items, save old content_tree.
 	 */
-	struct output *output;
 	wl_list_for_each(output, &server.outputs, link) {
 		struct overview_state *ov = &output->overview;
-		if (!ov->active || ov->ws_sliding) {
+		if (!ov->active) {
 			continue;
 		}
 
