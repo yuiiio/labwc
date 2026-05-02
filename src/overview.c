@@ -1268,6 +1268,7 @@ overview_goto_workspace(struct workspace *target, int direction)
 			ov->current_t = 1.0;
 			apply_visual_t(ov, 1.0);
 		}
+		ov->closing = false;
 
 		/* Hide hover/label UI from outgoing items */
 		struct overview_item *item;
