@@ -37,6 +37,7 @@
 #include "resize-outlines.h"
 #include "ssd.h"
 #include "view.h"
+#include "workspace-transition.h"
 #include "xwayland.h"
 
 #if WLR_HAS_LIBINPUT_BACKEND
@@ -551,6 +552,17 @@ cursor_update_common(const struct cursor_context *ctx,
 		 * Prevent updating focus/cursor image during
 		 * interactive move/resize, window switcher and
 		 * menu interaction.
+		 */
+		return;
+	}
+
+	if (workspace_transition_is_active()) {
+		/*
+		 * Prevent pointer focus from landing on the departing workspace's
+		 * windows (in from_overlay) during the slide animation.  Without
+		 * this, a motion event could focus an old-workspace surface, which
+		 * would later trigger workspaces_switch_to(old_ws) and corrupt the
+		 * transition state.
 		 */
 		return;
 	}
@@ -1153,6 +1165,18 @@ cursor_process_button_press(struct seat *seat, uint32_t button, uint32_t time_ms
 
 	/* Used on next button release to check if it can close menu or select menu item */
 	press_msec = time_msec;
+
+	if (workspace_transition_is_active()) {
+		/*
+		 * Swallow button presses during workspace slide animation.
+		 * Allowing them through can cause mousebinds to call
+		 * desktop_focus_view() on a window from the departing workspace
+		 * (visible in from_overlay), which triggers workspaces_switch_to()
+		 * and corrupts the transition, leaving both workspace trees disabled.
+		 */
+		lab_set_add(&seat->bound_buttons, button);
+		return false;
+	}
 
 	if (ctx.view || ctx.surface) {
 		/* Store cursor context for later action processing */
