@@ -571,7 +571,6 @@ handle_focused_surface_destroy(struct wl_listener *listener, void *data)
 {
 	struct input_method_relay *relay =
 		wl_container_of(listener, relay, focused_surface_destroy);
-	assert(relay->focused_surface == data);
 
 	input_method_relay_set_focus(relay, NULL);
 }

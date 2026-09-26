@@ -288,7 +288,6 @@ static void
 handle_commit(struct wl_listener *listener, void *data)
 {
 	struct view *view = wl_container_of(listener, view, commit);
-	assert(data && data == view->surface);
 
 	/* Must receive commit signal before accessing surface->current* */
 	struct wlr_surface_state *state = &view->surface->current;

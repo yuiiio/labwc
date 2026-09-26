@@ -779,11 +779,6 @@ warp_cursor_to_constraint_hint(struct seat *seat,
 static void
 handle_constraint_commit(struct wl_listener *listener, void *data)
 {
-	struct seat *seat = wl_container_of(listener, seat, constraint_commit);
-	struct wlr_pointer_constraint_v1 *constraint = seat->current_constraint;
-	/* Prevents unused variable warning when compiled without asserts */
-	(void)constraint;
-	assert(constraint->surface == data);
 }
 
 static void
@@ -791,7 +786,7 @@ handle_constraint_destroy(struct wl_listener *listener, void *data)
 {
 	struct constraint *constraint = wl_container_of(listener, constraint,
 		destroy);
-	struct wlr_pointer_constraint_v1 *wlr_constraint = data;
+	struct wlr_pointer_constraint_v1 *wlr_constraint = constraint->constraint;
 	struct seat *seat = constraint->seat;
 
 	wl_list_remove(&constraint->destroy.link);
